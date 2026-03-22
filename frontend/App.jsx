@@ -1,534 +1,1087 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
+import {
+  createPublicClient,
+  createWalletClient,
+  custom,
+  encodeFunctionData,
+  http,
+  isAddress,
+  stringToHex,
+  toHex,
+} from "viem";
+import { appConfig, getCreateCampaignConfigErrors, resolveApiUrl } from "./config.js";
+import { zusProtocolAbi } from "./zusProtocolAbi.js";
 
-/* ── Typewriter subtitle ── */
-const SUBTITLE = "Zus is a token-gated rewards protocol built on Avalanche — where eligibility is verified, identity stays hidden, and balances remain confidential.";
+const HOME_HASH = "#/";
+const CAMPAIGNS_HASH = "#/campaigns";
+const EMPTY_RECIPIENT = { leaf_address: "", amount: "1" };
 
-function TypewriterSub() {
-  const [text, setText] = useState("");
-  const [done, setDone] = useState(false);
-  useEffect(() => {
-    let i = 0, alive = true;
-    const t = setTimeout(function tick() {
-      if (!alive) return;
-      if (i <= SUBTITLE.length) {
-        setText(SUBTITLE.slice(0, i));
-        i++;
-        setTimeout(tick, 28);
-      } else { setDone(true); }
-    }, 1200);
-    return () => { alive = false; clearTimeout(t); };
-  }, []);
-  // highlight key phrases
-  const highlight = (str) => {
-    const parts = str.split(/(built on Avalanche|remain confidential)/g);
-    return parts.map((p, i) =>
-      (p === "built on Avalanche" || p === "remain confidential")
-        ? <span key={i} style={{ color: "#00ddb0" }}>{p}</span>
-        : p
-    );
-  };
-  return (
-    <p className="typewriter-sub" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "#3a6660", maxWidth: 400, margin: "24px auto 36px", lineHeight: 1.9, animation: "fadeUp .9s .6s both", minHeight: 80 }}>
-      {highlight(text)}
-      {!done && <span style={{ animation: "cur 0.7s steps(1) infinite", color: "#00ffc8" }}>▋</span>}
-    </p>
-  );
+function getCurrentRoute() {
+  if (typeof window === "undefined") {
+    return "home";
+  }
+
+  return window.location.hash.startsWith(CAMPAIGNS_HASH) ? "campaigns" : "home";
 }
 
-/* ── Pixel cat ── */
-function PixelCat() {
-  const [hov, setHov] = useState(false);
-  // 10x8 pixel grid, cyan on dark
-  const pixels = [
-    "0011011100",
-    "0111111110",
-    "1111111111",
-    "1010110101",  // eyes + nose row
-    "1111111111",
-    "0111111110",
-    "0101000101",  // legs
-    "0101000101",
-  ];
-  return (
-    <div
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{ cursor: "pointer", display: "inline-block", transition: "transform .2s", transform: hov ? "scale(1.3) translateY(-2px)" : "scale(1)" }}
-      title="=^._.^="
-    >
-      {pixels.map((row, ri) => (
-        <div key={ri} style={{ display: "flex" }}>
-          {row.split("").map((px, ci) => (
-            <div key={ci} style={{
-              width: 3, height: 3,
-              background: px === "1" ? (hov ? "#00ffc8" : "#00c49a") : "transparent",
-              boxShadow: px === "1" && hov ? "0 0 4px rgba(0,255,200,.6)" : "none",
-              transition: "background .2s, box-shadow .2s",
-            }} />
-          ))}
-        </div>
-      ))}
-    </div>
-  );
+function shortAddress(value) {
+  if (!value) {
+    return "Not connected";
+  }
+
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
-/* ── Scroll-reveal hook ── */
-function useReveal(threshold = 0.15) {
-  const ref = useRef(null);
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVisible(true); obs.disconnect(); } }, { threshold });
-    if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
-  }, []);
-  return [ref, visible];
+function shortHash(value) {
+  if (!value) {
+    return "";
+  }
+
+  return `${value.slice(0, 10)}...${value.slice(-8)}`;
 }
 
-/* ── Particle canvas ── */
-function Particles() {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const ctx = c.getContext("2d");
-    let W = c.width = c.offsetWidth, H = c.height = c.offsetHeight;
-    const pts = Array.from({ length: 55 }, () => ({
-      x: Math.random() * W, y: Math.random() * H,
-      vx: (Math.random() - .5) * .25, vy: (Math.random() - .5) * .25,
-      r: Math.random() * 1.2 + .4, o: Math.random() * .4 + .1,
-    }));
-    let raf;
-    function draw() {
-      ctx.clearRect(0, 0, W, H);
-      pts.forEach(p => {
-        p.x += p.vx; p.y += p.vy;
-        if (p.x < 0) p.x = W; if (p.x > W) p.x = 0;
-        if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
-        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(0,255,200,${p.o})`; ctx.fill();
-      });
-      pts.forEach((a, i) => pts.slice(i + 1).forEach(b => {
-        const d = Math.hypot(a.x - b.x, a.y - b.y);
-        if (d < 90) {
-          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-          ctx.strokeStyle = `rgba(0,255,200,${(1 - d / 90) * .1})`; ctx.lineWidth = .5; ctx.stroke();
-        }
-      }));
-      raf = requestAnimationFrame(draw);
+function parseErrorMessage(error) {
+  if (!error) {
+    return "Something went wrong.";
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  const candidate =
+    error?.shortMessage ||
+    error?.details ||
+    error?.message ||
+    error?.cause?.message;
+
+  return typeof candidate === "string" ? candidate : "Something went wrong.";
+}
+
+async function readJson(response) {
+  const text = await response.text();
+  let payload = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
     }
-    draw();
-    const onR = () => { W = c.width = c.offsetWidth; H = c.height = c.offsetHeight; };
-    window.addEventListener("resize", onR);
-    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", onR); };
-  }, []);
-  return <canvas ref={ref} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }} />;
+  }
+
+  if (!response.ok) {
+    const message =
+      payload?.message ||
+      payload?.error ||
+      payload?.details ||
+      text ||
+      `Request failed with status ${response.status}`;
+
+    throw new Error(message);
+  }
+
+  return payload;
 }
 
-/* ── Glitch text ── */
-function Glitch({ children, color }) {
-  const [on, setOn] = useState(false);
-  useEffect(() => {
-    const iv = setInterval(() => { setOn(true); setTimeout(() => setOn(false), 110); }, 5000 + Math.random() * 3000);
-    return () => clearInterval(iv);
-  }, []);
+function makeExplorerUrl(hash) {
+  if (!hash || !appConfig.explorerBaseUrl) {
+    return "";
+  }
+
+  const base = appConfig.explorerBaseUrl.endsWith("/")
+    ? appConfig.explorerBaseUrl
+    : `${appConfig.explorerBaseUrl}/`;
+
+  return `${base}${hash}`;
+}
+
+function Button({
+  children,
+  onClick,
+  variant = "solid",
+  type = "button",
+  disabled = false,
+  className = "",
+}) {
+  const classes = [
+    "btn",
+    variant === "ghost" ? "btn-ghost" : "btn-solid",
+    disabled ? "is-disabled" : "",
+    className,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return (
-    <span style={{ color: color || "inherit", position: "relative", display: "inline-block", animation: on ? "glitch .12s steps(2) both" : "none" }}>
+    <button className={classes} onClick={onClick} type={type} disabled={disabled}>
       {children}
-    </span>
+    </button>
   );
 }
 
-/* ── Neon button ── */
-function Btn({ children, outline, className = "" }) {
-  const [hov, setHov] = useState(false);
-  const base = {
-    fontFamily: "'Share Tech Mono', monospace",
-    fontSize: 10,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    padding: "10px 22px",
-    cursor: "pointer",
-    border: "1px solid",
-    transition: "all .25s",
-    position: "relative",
-    display: "inline-block",
-  };
-  if (outline) return (
-    <button className={className} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)} style={{
-      ...base,
-      background: "transparent",
-      color: hov ? "#00ffc8" : "#4a7a72",
-      borderColor: hov ? "#00ffc8" : "#1a4040",
-      boxShadow: hov ? "0 0 18px rgba(0,255,200,.35), inset 0 0 18px rgba(0,255,200,.04)" : "none",
-    }}>{children}</button>
-  );
+function MetricCard({ label, value, detail }) {
   return (
-    <button className={className} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)} style={{
-      ...base,
-      background: hov ? "#00ffc8" : "#00ddb0",
-      color: "#020d0f",
-      borderColor: hov ? "#00ffc8" : "#00ddb0",
-      boxShadow: hov ? "0 0 24px rgba(0,255,200,.7), 0 0 48px rgba(0,255,200,.3)" : "0 0 10px rgba(0,255,200,.2)",
-      fontWeight: 700,
-    }}>{children}</button>
+    <article className="metric-card">
+      <span className="metric-label">{label}</span>
+      <strong className="metric-value">{value}</strong>
+      <span className="metric-detail">{detail}</span>
+    </article>
   );
 }
 
-/* ── Feature card ── */
-function FeatCard({ tag, title, desc, extra, delay }) {
-  const [ref, vis] = useReveal();
-  const [hov, setHov] = useState(false);
+function WalletButton({ wallet, onConnect }) {
+  const label = wallet.account ? shortAddress(wallet.account) : "Connect Wallet";
+
   return (
-    <div ref={ref} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)} style={{
-      border: `1px solid ${hov ? "rgba(0,255,200,.25)" : "rgba(0,255,200,.08)"}`,
-      background: hov ? "rgba(0,255,200,.03)" : "transparent",
-      padding: "20px",
-      position: "relative",
-      opacity: vis ? 1 : 0,
-      transform: vis ? "translateY(0)" : "translateY(20px)",
-      transition: `opacity .6s ${delay}ms, transform .6s ${delay}ms, border-color .3s, background .3s`,
-      overflow: "hidden",
-    }}>
-      <div style={{
-        position: "absolute", top: 0, left: 0, right: 0, height: 1,
-        background: "linear-gradient(90deg,transparent,#00ffc8,transparent)",
-        opacity: hov ? 1 : 0, transition: "opacity .3s",
-      }} />
-      <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 2, marginBottom: 12 }}>{tag}</div>
-      <h3 style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "#e0f0ed", letterSpacing: 1, marginBottom: 10, lineHeight: 1.5 }}>{title}</h3>
-      <p style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", lineHeight: 1.8, marginBottom: 14 }}>{desc}</p>
-      {extra && <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550" }}>{extra}</div>}
-      <div style={{ marginTop: 16, height: 1, background: "rgba(0,255,200,.06)" }}>
-        <div style={{ height: "100%", width: "55%", background: "linear-gradient(90deg,#00ffc8,transparent)" }} />
+    <div className="wallet-cluster">
+      <Button
+        variant={wallet.account ? "ghost" : "solid"}
+        onClick={() => {
+          void onConnect();
+        }}
+        disabled={wallet.connecting}
+      >
+        {wallet.connecting ? "Connecting..." : label}
+      </Button>
+      <span className="wallet-meta">
+        {wallet.account
+          ? wallet.chainId
+            ? `Chain ${wallet.chainId}`
+            : "Wallet ready"
+          : "Browser wallet required"}
+      </span>
+    </div>
+  );
+}
+
+function Navigation({ route, onNavigate, wallet, onConnect }) {
+  return (
+    <header className="topbar">
+      <div
+        className="brand-block"
+        onClick={() => onNavigate("home")}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onNavigate("home");
+          }
+        }}
+        role="button"
+        tabIndex={0}
+      >
+        <span className="brand-kicker">Privacy-first rewards</span>
+        <span className="brand-title">ZUS_PROTOCOL</span>
       </div>
+
+      <nav className="topnav">
+        <button
+          className={`nav-link ${route === "home" ? "is-active" : ""}`}
+          onClick={() => onNavigate("home")}
+          type="button"
+        >
+          Home
+        </button>
+        <button
+          className={`nav-link ${route === "campaigns" ? "is-active" : ""}`}
+          onClick={() => onNavigate("campaigns")}
+          type="button"
+        >
+          Campaigns
+        </button>
+      </nav>
+
+      <WalletButton wallet={wallet} onConnect={onConnect} />
+    </header>
+  );
+}
+
+function SectionHeader({ eyebrow, title, body }) {
+  return (
+    <div className="section-header">
+      <span className="section-eyebrow">{eyebrow}</span>
+      <h2>{title}</h2>
+      <p>{body}</p>
     </div>
   );
 }
 
-/* ── How step ── */
-function HowStep({ dot, title, desc, delay }) {
-  const [ref, vis] = useReveal();
+function StatusPanel({
+  wallet,
+  campaignCount,
+  creatorCount,
+  totalRecipients,
+  pendingDeployment,
+  createState,
+  onNavigate,
+}) {
+  const explorerUrl = makeExplorerUrl(createState.txHash);
+
   return (
-    <div className="how-step" ref={ref} style={{
-      display: "flex", gap: 16, alignItems: "flex-start",
-      padding: "20px 24px",
-      border: "1px solid rgba(0,255,200,.07)",
-      opacity: vis ? 1 : 0,
-      transform: vis ? "translateX(0)" : "translateX(-20px)",
-      transition: `opacity .6s ${delay}ms, transform .6s ${delay}ms`,
-    }}>
-      <div style={{
-        width: 32, height: 32, flexShrink: 0,
-        background: "rgba(0,255,200,.08)",
-        border: "1px solid rgba(0,255,200,.2)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "#00ddb0",
-      }}>{dot}</div>
-      <div>
-        <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "#cce8e4", letterSpacing: 1, marginBottom: 6 }}>{title}</div>
-        <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", lineHeight: 1.8 }}>{desc}</div>
+    <aside className="panel status-panel">
+      <SectionHeader
+        eyebrow="App status"
+        title="Ready for the Rust API and the contract"
+        body="Get Started jumps into the live campaign feed, and the create flow stores the Merkle campaign offchain before asking your wallet to deploy the matching onchain campaign."
+      />
+
+      <div className="status-grid">
+        <MetricCard
+          label="Campaigns"
+          value={campaignCount.toLocaleString()}
+          detail="Loaded from GET /campaigns"
+        />
+        <MetricCard
+          label="Creators"
+          value={creatorCount.toLocaleString()}
+          detail="Unique wallet creators in the API"
+        />
+        <MetricCard
+          label="Recipients"
+          value={totalRecipients.toLocaleString()}
+          detail="Summed from Rust API leaf counts"
+        />
       </div>
-    </div>
+
+      <div className="callout">
+        <span className="callout-label">Wallet</span>
+        <strong>{wallet.account ? shortAddress(wallet.account) : "Connect before creating"}</strong>
+        <p>
+          {wallet.account
+            ? "The connected wallet becomes the API campaign creator and signs the contract deployment."
+            : "Reading campaigns does not need a wallet, but create campaign does."}
+        </p>
+      </div>
+
+      <div className="callout">
+        <span className="callout-label">Environment</span>
+        <strong>{appConfig.apiBaseUrl}</strong>
+        <p>
+          RPC: {appConfig.rpcUrl || "missing"} | Protocol:{" "}
+          {appConfig.protocolAddress || "missing"}
+        </p>
+      </div>
+
+      {pendingDeployment ? (
+        <div className="callout warning">
+          <span className="callout-label">Pending onchain step</span>
+          <strong>{pendingDeployment.apiCampaign.name}</strong>
+          <p>
+            Rust API campaign <code>{pendingDeployment.apiCampaign.campaign_id}</code> already
+            exists. Finish the wallet transaction to avoid creating a duplicate API campaign.
+          </p>
+          <Button variant="ghost" onClick={() => onNavigate("campaigns")}>
+            Finish Deployment
+          </Button>
+        </div>
+      ) : null}
+
+      {createState.success ? (
+        <div className="flash success">
+          <strong>{createState.success}</strong>
+          {createState.apiCampaign ? (
+            <p>
+              API campaign: <code>{createState.apiCampaign.campaign_id}</code>
+            </p>
+          ) : null}
+          {createState.txHash ? (
+            explorerUrl ? (
+              <a href={explorerUrl} target="_blank" rel="noreferrer">
+                View transaction {shortHash(createState.txHash)}
+              </a>
+            ) : (
+              <p>Transaction {shortHash(createState.txHash)}</p>
+            )
+          ) : null}
+        </div>
+      ) : null}
+
+      {createState.error ? (
+        <div className="flash error">
+          <strong>Create flow needs attention</strong>
+          <p>{createState.error}</p>
+        </div>
+      ) : null}
+    </aside>
   );
 }
 
-/* ── Use case card ── */
-function UseCard({ title, desc, delay }) {
-  const [ref, vis] = useReveal(0.1);
-  const [hov, setHov] = useState(false);
+function CampaignCard({ campaign }) {
   return (
-    <div ref={ref} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)} style={{
-      border: `1px solid ${hov ? "rgba(0,255,200,.2)" : "rgba(0,255,200,.07)"}`,
-      background: hov ? "rgba(0,255,200,.02)" : "transparent",
-      padding: "20px",
-      opacity: vis ? 1 : 0,
-      transform: vis ? "translateY(0)" : "translateY(16px)",
-      transition: `opacity .5s ${delay}ms, transform .5s ${delay}ms, border-color .3s`,
-    }}>
-      <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 10, color: "#00ddb0", letterSpacing: 1.5, marginBottom: 8 }}>{title}</div>
-      <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", lineHeight: 1.8 }}>{desc}</div>
-    </div>
+    <article className="campaign-card">
+      <div className="campaign-card-top">
+        <span className="campaign-tag">Campaign</span>
+        <span className="campaign-id">{campaign.campaign_id}</span>
+      </div>
+      <h3>{campaign.name}</h3>
+      <dl>
+        <div>
+          <dt>Creator</dt>
+          <dd>{campaign.campaign_creator_address}</dd>
+        </div>
+        <div>
+          <dt>Recipients</dt>
+          <dd>{campaign.leaf_count.toLocaleString()}</dd>
+        </div>
+        <div>
+          <dt>Onchain ID</dt>
+          <dd>{campaign.onchain_campaign_id}</dd>
+        </div>
+        <div>
+          <dt>Merkle root</dt>
+          <dd>{campaign.merkle_root}</dd>
+        </div>
+      </dl>
+    </article>
+  );
+}
+
+function HomePage({ campaigns, wallet, onConnect, onNavigate }) {
+  return (
+    <main className="page-shell">
+      <section className="hero">
+        <div className="hero-copy">
+          <span className="hero-kicker">Zero-knowledge reward operations</span>
+          <h1>
+            Rewards without public recipient leakage.
+          </h1>
+          <p>
+            The frontend now points at the Rust campaign API by environment variable, shows the
+            live campaign feed, and asks the connected wallet to create the matching onchain
+            campaign through the Zus protocol contract.
+          </p>
+          <div className="hero-actions">
+            <Button onClick={() => onNavigate("campaigns")}>Get Started</Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                void onConnect();
+              }}
+            >
+              {wallet.account ? "Wallet Connected" : "Connect Wallet"}
+            </Button>
+          </div>
+          <div className="hero-note">
+            API: <code>{appConfig.apiBaseUrl}</code> | RPC:{" "}
+            <code>{appConfig.rpcUrl || "set VITE_RPC_URL"}</code>
+          </div>
+        </div>
+
+        <div className="hero-panel panel">
+          <SectionHeader
+            eyebrow="Live preview"
+            title="Latest campaigns from the Rust service"
+            body="These are loaded from the same API endpoint the dashboard uses, so the Get Started flow takes you into a real dataset instead of a hard-coded mock."
+          />
+          <div className="hero-campaigns">
+            {campaigns.slice(0, 3).map((campaign) => (
+              <div key={campaign.campaign_id} className="mini-campaign">
+                <strong>{campaign.name}</strong>
+                <span>{campaign.leaf_count} recipients</span>
+                <code>{shortAddress(campaign.campaign_creator_address)}</code>
+              </div>
+            ))}
+            {campaigns.length === 0 ? (
+              <div className="mini-campaign empty">
+                <strong>No campaigns yet</strong>
+                <span>Once the Rust API has data, it will appear here and in the dashboard.</span>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <section className="feature-band">
+        <article className="feature-card">
+          <span>Step 1</span>
+          <h3>Create in Rust API</h3>
+          <p>
+            The browser sends the campaign name, creator address, and recipient matrix to the Axum
+            service at <code>/campaigns</code>.
+          </p>
+        </article>
+        <article className="feature-card">
+          <span>Step 2</span>
+          <h3>Deploy onchain</h3>
+          <p>
+            Using the wallet plus env-configured RPC, the app calls
+            <code> createCampaign(bytes32,address,bytes32,bytes8,uint256)</code>.
+          </p>
+        </article>
+        <article className="feature-card">
+          <span>Step 3</span>
+          <h3>Read everything back</h3>
+          <p>
+            The campaigns page refreshes from the Rust API so operators can verify the offchain and
+            onchain identifiers line up.
+          </p>
+        </article>
+      </section>
+    </main>
+  );
+}
+
+function CampaignsPage({
+  campaigns,
+  campaignsLoading,
+  campaignsError,
+  form,
+  wallet,
+  createState,
+  pendingDeployment,
+  onFormChange,
+  onRecipientChange,
+  onAddRecipient,
+  onRemoveRecipient,
+  onSubmitCreate,
+  onRefresh,
+}) {
+  return (
+    <main className="page-shell campaigns-page">
+      <section className="dashboard-header">
+        <div>
+          <span className="section-eyebrow">Get Started</span>
+          <h1>Campaign operator dashboard</h1>
+          <p>
+            All campaigns below come from the Rust API configured by <code>VITE_API_BASE_URL</code>
+            . Creating a campaign first persists the Merkle data in Rust, then deploys the matching
+            onchain campaign through the connected wallet.
+          </p>
+        </div>
+        <div className="dashboard-actions">
+          <Button variant="ghost" onClick={onRefresh} disabled={campaignsLoading}>
+            {campaignsLoading ? "Refreshing..." : "Refresh Campaigns"}
+          </Button>
+        </div>
+      </section>
+
+      <section className="dashboard-grid">
+        <article className="panel form-panel">
+          <SectionHeader
+            eyebrow="Create campaign"
+            title="API first, contract second"
+            body="Use decimal strings for payout and funding amounts in wei. Recipient rows map directly to the Rust API payload."
+          />
+
+          <div className="form-grid">
+            <label className="field">
+              <span>Campaign name</span>
+              <input
+                value={form.name}
+                onChange={(event) => onFormChange("name", event.target.value)}
+                placeholder="Fuji community drop"
+              />
+            </label>
+
+            <label className="field">
+              <span>Creator wallet</span>
+              <input value={wallet.account || ""} placeholder="Connect wallet" readOnly />
+            </label>
+
+            <label className="field">
+              <span>Payout wei</span>
+              <input
+                value={form.payoutWei}
+                onChange={(event) => onFormChange("payoutWei", event.target.value)}
+                inputMode="numeric"
+                placeholder="100000000000000"
+              />
+            </label>
+
+            <label className="field">
+              <span>Funding wei</span>
+              <input
+                value={form.fundingWei}
+                onChange={(event) => onFormChange("fundingWei", event.target.value)}
+                inputMode="numeric"
+                placeholder="100000000000000"
+              />
+            </label>
+          </div>
+
+          <div className="recipient-header">
+            <div>
+              <span className="section-eyebrow">Recipients</span>
+              <p>At least one address and integer amount are required.</p>
+            </div>
+            <Button variant="ghost" onClick={onAddRecipient}>
+              Add row
+            </Button>
+          </div>
+
+          <div className="recipient-list">
+            {form.recipients.map((recipient, index) => (
+              <div className="recipient-row" key={`recipient-${index}`}>
+                <label className="field">
+                  <span>Wallet {index + 1}</span>
+                  <input
+                    value={recipient.leaf_address}
+                    onChange={(event) =>
+                      onRecipientChange(index, "leaf_address", event.target.value)
+                    }
+                    placeholder="0x..."
+                  />
+                </label>
+                <label className="field">
+                  <span>Amount</span>
+                  <input
+                    value={recipient.amount}
+                    onChange={(event) => onRecipientChange(index, "amount", event.target.value)}
+                    inputMode="numeric"
+                    placeholder="1"
+                  />
+                </label>
+                <Button
+                  variant="ghost"
+                  className="remove-row"
+                  onClick={() => onRemoveRecipient(index)}
+                  disabled={form.recipients.length === 1}
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+          </div>
+
+          <div className="form-note">
+            <strong>Configured contract message:</strong> <code>{appConfig.campaignMessage}</code>
+            <br />
+            <strong>Protocol contract:</strong> <code>{appConfig.protocolAddress || "missing"}</code>
+            <br />
+            <strong>Verifier:</strong> <code>{appConfig.verifierAddress || "missing"}</code>
+          </div>
+
+          <div className="form-actions">
+            <Button
+              onClick={() => {
+                void onSubmitCreate();
+              }}
+              disabled={createState.loading}
+            >
+              {createState.loading
+                ? "Working..."
+                : pendingDeployment
+                  ? "Complete Onchain Deployment"
+                  : "Create Campaign"}
+            </Button>
+            <span className="muted-copy">
+              {pendingDeployment
+                ? "The Rust API step already succeeded. This resumes the wallet transaction only."
+                : "This will POST to the Rust API and then open the wallet transaction."}
+            </span>
+          </div>
+        </article>
+
+        <article className="panel campaign-feed">
+          <SectionHeader
+            eyebrow="All campaigns"
+            title="Live Rust API feed"
+            body="This list is driven by GET /campaigns so the frontend stays in sync with the backend campaign catalog."
+          />
+
+          {campaignsError ? (
+            <div className="flash error">
+              <strong>Could not load campaigns</strong>
+              <p>{campaignsError}</p>
+            </div>
+          ) : null}
+
+          {campaignsLoading ? <div className="loading-state">Loading campaigns...</div> : null}
+
+          {!campaignsLoading && campaigns.length === 0 ? (
+            <div className="empty-state">
+              <strong>No campaigns returned yet.</strong>
+              <p>Create one above and it will appear here after the Rust API responds.</p>
+            </div>
+          ) : null}
+
+          <div className="campaign-list">
+            {campaigns.map((campaign) => (
+              <CampaignCard campaign={campaign} key={campaign.campaign_id} />
+            ))}
+          </div>
+        </article>
+      </section>
+    </main>
   );
 }
 
 export default function App() {
-  const [scrolled, setScrolled] = useState(false);
+  const [route, setRoute] = useState(getCurrentRoute);
+  const [wallet, setWallet] = useState({
+    account: "",
+    chainId: "",
+    connecting: false,
+    error: "",
+  });
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignsLoading, setCampaignsLoading] = useState(true);
+  const [campaignsError, setCampaignsError] = useState("");
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const [form, setForm] = useState({
+    name: "",
+    payoutWei: appConfig.defaultPayoutWei,
+    fundingWei: appConfig.defaultFundingWei,
+    recipients: [{ ...EMPTY_RECIPIENT }],
+  });
+  const [pendingDeployment, setPendingDeployment] = useState(null);
+  const [createState, setCreateState] = useState({
+    loading: false,
+    error: "",
+    success: "",
+    txHash: "",
+    apiCampaign: null,
+  });
+
   useEffect(() => {
-    const fn = () => setScrolled(window.scrollY > 30);
-    window.addEventListener("scroll", fn);
-    return () => window.removeEventListener("scroll", fn);
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const handleHashChange = () => setRoute(getCurrentRoute());
+    window.addEventListener("hashchange", handleHashChange);
+
+    return () => window.removeEventListener("hashchange", handleHashChange);
   }, []);
 
+  useEffect(() => {
+    if (!window.ethereum?.request) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const syncWallet = async () => {
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        const chainIdHex = await window.ethereum.request({ method: "eth_chainId" });
+        if (cancelled) {
+          return;
+        }
+
+        setWallet((current) => ({
+          ...current,
+          account: accounts?.[0] || "",
+          chainId: chainIdHex ? Number.parseInt(chainIdHex, 16).toString() : "",
+          error: "",
+        }));
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        setWallet((current) => ({
+          ...current,
+          error: parseErrorMessage(error),
+        }));
+      }
+    };
+
+    syncWallet();
+
+    const handleAccountsChanged = (accounts) => {
+      setWallet((current) => ({
+        ...current,
+        account: accounts?.[0] || "",
+        error: "",
+      }));
+    };
+
+    const handleChainChanged = (chainIdHex) => {
+      setWallet((current) => ({
+        ...current,
+        chainId: chainIdHex ? Number.parseInt(chainIdHex, 16).toString() : "",
+      }));
+    };
+
+    window.ethereum.on?.("accountsChanged", handleAccountsChanged);
+    window.ethereum.on?.("chainChanged", handleChainChanged);
+
+    return () => {
+      cancelled = true;
+      window.ethereum.removeListener?.("accountsChanged", handleAccountsChanged);
+      window.ethereum.removeListener?.("chainChanged", handleChainChanged);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCampaigns = async () => {
+      setCampaignsLoading(true);
+      setCampaignsError("");
+
+      try {
+        const data = await readJson(await fetch(resolveApiUrl("/campaigns")));
+        if (cancelled) {
+          return;
+        }
+
+        setCampaigns(Array.isArray(data) ? data : []);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        setCampaignsError(parseErrorMessage(error));
+      } finally {
+        if (!cancelled) {
+          setCampaignsLoading(false);
+        }
+      }
+    };
+
+    loadCampaigns();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshNonce]);
+
+  const campaignCount = campaigns.length;
+  const creatorCount = new Set(campaigns.map((campaign) => campaign.campaign_creator_address)).size;
+  const totalRecipients = campaigns.reduce(
+    (sum, campaign) => sum + Number(campaign.leaf_count || 0),
+    0,
+  );
+
+  const navigate = (nextRoute) => {
+    if (typeof window === "undefined") {
+      setRoute(nextRoute);
+      return;
+    }
+
+    window.location.hash = nextRoute === "campaigns" ? CAMPAIGNS_HASH : HOME_HASH;
+  };
+
+  const connectWallet = async () => {
+    if (!window.ethereum?.request) {
+      setWallet((current) => ({
+        ...current,
+        error: "No injected wallet found. Install MetaMask or another EVM wallet.",
+      }));
+      throw new Error("No injected wallet found.");
+    }
+
+    setWallet((current) => ({ ...current, connecting: true, error: "" }));
+
+    try {
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const chainIdHex = await window.ethereum.request({ method: "eth_chainId" });
+      const account = accounts?.[0] || "";
+      const chainId = chainIdHex ? Number.parseInt(chainIdHex, 16).toString() : "";
+
+      setWallet((current) => ({
+        ...current,
+        account,
+        chainId,
+        connecting: false,
+        error: "",
+      }));
+
+      return account;
+    } catch (error) {
+      const message = parseErrorMessage(error);
+      setWallet((current) => ({
+        ...current,
+        connecting: false,
+        error: message,
+      }));
+      throw error;
+    }
+  };
+
+  const updateForm = (field, value) => {
+    setForm((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  };
+
+  const updateRecipient = (index, field, value) => {
+    setForm((current) => ({
+      ...current,
+      recipients: current.recipients.map((recipient, recipientIndex) =>
+        recipientIndex === index ? { ...recipient, [field]: value } : recipient,
+      ),
+    }));
+  };
+
+  const addRecipient = () => {
+    setForm((current) => ({
+      ...current,
+      recipients: [...current.recipients, { ...EMPTY_RECIPIENT }],
+    }));
+  };
+
+  const removeRecipient = (index) => {
+    setForm((current) => ({
+      ...current,
+      recipients:
+        current.recipients.length === 1
+          ? current.recipients
+          : current.recipients.filter((_, recipientIndex) => recipientIndex !== index),
+    }));
+  };
+
+  const resetForm = () => {
+    setForm({
+      name: "",
+      payoutWei: appConfig.defaultPayoutWei,
+      fundingWei: appConfig.defaultFundingWei,
+      recipients: [{ ...EMPTY_RECIPIENT }],
+    });
+  };
+
+  const validateForm = async () => {
+    const configErrors = getCreateCampaignConfigErrors();
+    if (configErrors.length > 0) {
+      throw new Error(`Missing config: ${configErrors.join(", ")}`);
+    }
+
+    const name = form.name.trim();
+    if (!name) {
+      throw new Error("Campaign name is required.");
+    }
+
+    const payoutWei = form.payoutWei.trim();
+    if (!/^[0-9]+$/.test(payoutWei)) {
+      throw new Error("Payout wei must be a base-10 integer.");
+    }
+
+    const fundingWei = form.fundingWei.trim();
+    if (!/^[0-9]+$/.test(fundingWei)) {
+      throw new Error("Funding wei must be a base-10 integer.");
+    }
+
+    const recipients = [];
+    for (const [index, entry] of form.recipients.entries()) {
+      const leafAddress = entry.leaf_address.trim();
+      const amount = entry.amount.trim();
+
+      if (!leafAddress && !amount) {
+        continue;
+      }
+
+      if (!leafAddress || !amount) {
+        throw new Error(`Recipient row ${index + 1} needs both wallet and amount.`);
+      }
+
+      if (!isAddress(leafAddress)) {
+        throw new Error(`Recipient row ${index + 1} has an invalid EVM address.`);
+      }
+
+      if (!/^[0-9]+$/.test(amount)) {
+        throw new Error(`Recipient row ${index + 1} amount must be an integer string.`);
+      }
+
+      recipients.push({
+        leaf_address: leafAddress,
+        amount,
+      });
+    }
+
+    if (recipients.length === 0) {
+      throw new Error("Add at least one recipient.");
+    }
+
+    const creatorAddress = wallet.account || (await connectWallet());
+    if (!creatorAddress || !isAddress(creatorAddress)) {
+      throw new Error("Connect a valid wallet before creating campaigns.");
+    }
+
+    return {
+      name,
+      payoutWei,
+      fundingWei,
+      recipients,
+      creatorAddress,
+    };
+  };
+
+  const deployOnchainCampaign = async (deployment) => {
+    if (!window.ethereum?.request) {
+      throw new Error("No injected wallet found for the contract transaction.");
+    }
+
+    const account = wallet.account || (await connectWallet());
+    if (!account) {
+      throw new Error("Connect a wallet before deploying the onchain campaign.");
+    }
+
+    setCreateState({
+      loading: true,
+      error: "",
+      success: "Rust API campaign ready. Waiting for wallet signature...",
+      txHash: "",
+      apiCampaign: deployment.apiCampaign,
+    });
+
+    const walletClient = createWalletClient({
+      transport: custom(window.ethereum),
+    });
+
+    const transactionHash = await walletClient.sendTransaction({
+      account,
+      to: appConfig.protocolAddress,
+      value: BigInt(deployment.fundingWei),
+      data: encodeFunctionData({
+        abi: zusProtocolAbi,
+        functionName: "createCampaign",
+        args: [
+          deployment.apiCampaign.onchain_campaign_id,
+          appConfig.verifierAddress,
+          toHex(BigInt(deployment.apiCampaign.merkle_root), { size: 32 }),
+          stringToHex(appConfig.campaignMessage, { size: 8 }),
+          BigInt(deployment.payoutWei),
+        ],
+      }),
+    });
+
+    setCreateState({
+      loading: true,
+      error: "",
+      success: "Transaction submitted. Waiting for RPC confirmation...",
+      txHash: transactionHash,
+      apiCampaign: deployment.apiCampaign,
+    });
+
+    const publicClient = createPublicClient({
+      transport: http(appConfig.rpcUrl),
+    });
+
+    await publicClient.waitForTransactionReceipt({ hash: transactionHash });
+
+    setPendingDeployment(null);
+    setCreateState({
+      loading: false,
+      error: "",
+      success: "Campaign created in the Rust API and confirmed onchain.",
+      txHash: transactionHash,
+      apiCampaign: deployment.apiCampaign,
+    });
+    resetForm();
+    setRefreshNonce((current) => current + 1);
+  };
+
+  const submitCreate = async () => {
+    setCreateState((current) => ({
+      ...current,
+      error: "",
+      success: "",
+      txHash: current.txHash,
+    }));
+
+    if (pendingDeployment) {
+      try {
+        await deployOnchainCampaign(pendingDeployment);
+      } catch (error) {
+        setCreateState({
+          loading: false,
+          error: `${parseErrorMessage(error)} The Rust API campaign still exists, so use this button again to finish the onchain step without creating a duplicate API campaign.`,
+          success: "",
+          txHash: "",
+          apiCampaign: pendingDeployment.apiCampaign,
+        });
+      }
+
+      return;
+    }
+
+    let deployment = null;
+
+    try {
+      const validated = await validateForm();
+
+      setCreateState({
+        loading: true,
+        error: "",
+        success: "Creating campaign in the Rust API...",
+        txHash: "",
+        apiCampaign: null,
+      });
+
+      const apiCampaign = await readJson(
+        await fetch(resolveApiUrl("/campaigns"), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            name: validated.name,
+            campaign_creator_address: validated.creatorAddress,
+            recipients: validated.recipients,
+          }),
+        }),
+      );
+
+      deployment = {
+        apiCampaign,
+        payoutWei: validated.payoutWei,
+        fundingWei: validated.fundingWei,
+      };
+
+      setPendingDeployment(deployment);
+      await deployOnchainCampaign(deployment);
+    } catch (error) {
+      const detail = parseErrorMessage(error);
+      setCreateState({
+        loading: false,
+        error: deployment
+          ? `${detail} Rust API campaign ${deployment.apiCampaign.campaign_id} was created, but the contract transaction did not finish. Resume with "Complete Onchain Deployment".`
+          : detail,
+        success: "",
+        txHash: "",
+        apiCampaign: deployment?.apiCampaign || null,
+      });
+    }
+  };
+
   return (
-    <>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 3px; }
-        ::-webkit-scrollbar-track { background: #020d0f; }
-        ::-webkit-scrollbar-thumb { background: #00806a; }
-        body { background: #020d0f; margin: 0; overflow-x: hidden; }
-        @keyframes cur { 0%,100%{opacity:1} 50%{opacity:0} }
-        @keyframes glitch {
-          0%   { clip-path:inset(20% 0 60% 0); transform:translate(-2px,0); }
-          33%  { clip-path:inset(60% 0 10% 0); transform:translate(2px,0); filter:hue-rotate(20deg); }
-          66%  { clip-path:inset(40% 0 40% 0); transform:translate(-1px,0); }
-          100% { clip-path:none; transform:translate(0); }
-        }
-        @keyframes fadeUp { from{opacity:0;transform:translateY(18px)} to{opacity:1;transform:translateY(0)} }
-        @keyframes glowPulse {
-          0%,100% { text-shadow: 0 0 28px rgba(0,255,200,.5),0 0 56px rgba(0,255,200,.2); }
-          50%     { text-shadow: 0 0 48px rgba(0,255,200,.85),0 0 90px rgba(0,255,200,.4),0 0 130px rgba(0,255,200,.1); }
-        }
-        button { outline: none; }
-        @media (max-width: 900px) {
-          .top-nav {
-            padding: 14px 20px !important;
-          }
-          .nav-actions {
-            gap: 16px !important;
-          }
-          .nav-cta {
-            padding: 10px 16px !important;
-          }
-          .content-section,
-          .use-cases-section {
-            padding: 72px 24px !important;
-          }
-          .site-footer {
-            padding: 20px 24px !important;
-          }
-        }
-        @media (max-width: 680px) {
-          .top-nav {
-            flex-direction: column !important;
-            align-items: flex-start !important;
-            gap: 14px !important;
-            padding: 14px 16px !important;
-          }
-          .nav-brand {
-            font-size: 11px !important;
-            letter-spacing: 2px !important;
-          }
-          .nav-actions {
-            width: 100% !important;
-            justify-content: space-between !important;
-            gap: 10px !important;
-            flex-wrap: wrap !important;
-          }
-          .nav-link {
-            font-size: 8px !important;
-            letter-spacing: 1.5px !important;
-          }
-          .nav-cta,
-          .hero-btn {
-            width: 100% !important;
-            justify-content: center !important;
-            text-align: center !important;
-          }
-          .hero-section {
-            min-height: auto !important;
-            padding: 164px 16px 72px !important;
-          }
-          .hero-content {
-            width: 100% !important;
-            max-width: 520px !important;
-          }
-          .hero-eyebrow {
-            width: 100% !important;
-            max-width: 320px !important;
-            font-size: 8px !important;
-            letter-spacing: 2px !important;
-            padding: 6px 10px !important;
-          }
-          .hero-title {
-            font-size: clamp(36px, 17vw, 62px) !important;
-            letter-spacing: 1px !important;
-            line-height: 1.02 !important;
-          }
-          .typewriter-sub {
-            max-width: none !important;
-            width: 100% !important;
-            min-height: 96px !important;
-            font-size: 10px !important;
-            margin: 20px auto 28px !important;
-            line-height: 1.85 !important;
-          }
-          .hero-actions {
-            flex-direction: column !important;
-            gap: 10px !important;
-            align-items: stretch !important;
-          }
-          .content-section,
-          .use-cases-section,
-          .ledger-section {
-            padding-left: 16px !important;
-            padding-right: 16px !important;
-          }
-          .feature-grid,
-          .use-cases-grid {
-            grid-template-columns: 1fr !important;
-          }
-          .how-step {
-            flex-direction: column !important;
-            gap: 12px !important;
-            padding: 18px !important;
-          }
-          .ledger-copy {
-            line-height: 1.85 !important;
-          }
-          .desktop-break {
-            display: none !important;
-          }
-          .site-footer {
-            flex-direction: column !important;
-            gap: 16px !important;
-            text-align: center !important;
-            padding: 20px 16px 28px !important;
-          }
-          .footer-brand {
-            justify-content: center !important;
-          }
-          .footer-copy,
-          .footer-links {
-            text-align: center !important;
-          }
-        }
-      `}</style>
+    <div className="app-frame">
+      <Navigation route={route} onNavigate={navigate} wallet={wallet} onConnect={connectWallet} />
 
-      {/* NAV */}
-      <nav className="top-nav" style={{
-        position: "fixed", top: 0, left: 0, right: 0, zIndex: 100,
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "14px 40px",
-        background: scrolled ? "rgba(2,13,15,.92)" : "transparent",
-        backdropFilter: scrolled ? "blur(12px)" : "none",
-        borderBottom: scrolled ? "1px solid rgba(0,255,200,.08)" : "1px solid transparent",
-        transition: "all .4s",
-      }}>
-        <span className="nav-brand" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 12, color: "#00ffc8", letterSpacing: 3, textShadow: "0 0 14px rgba(0,255,200,.5)" }}>
-          ZUS_PROTOCOL
-        </span>
-        <div className="nav-actions" style={{ display: "flex", gap: 32, alignItems: "center" }}>
-          {["PRINCIPLES","FEATURES"].map(t => (
-            <a className="nav-link" key={t} href="#" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", letterSpacing: 2, textDecoration: "none", transition: "color .2s" }}
-              onMouseEnter={e => e.target.style.color = "#00ffc8"}
-              onMouseLeave={e => e.target.style.color = "#3a6660"}>{t}</a>
-          ))}
-          <Btn className="nav-cta">LAUNCH APP</Btn>
+      {wallet.error ? (
+        <div className="global-banner error">
+          <strong>Wallet</strong>
+          <span>{wallet.error}</span>
         </div>
-      </nav>
+      ) : null}
 
-      {/* HERO */}
-      <section className="hero-section" style={{ position: "relative", minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "120px 24px 80px", overflow: "hidden" }}>
-        <div style={{ position: "absolute", inset: 0, zIndex: 0,
-          background: "radial-gradient(ellipse 65% 45% at 50% 35%, rgba(0,255,200,.055) 0%, transparent 70%), radial-gradient(ellipse 35% 25% at 15% 85%, rgba(0,180,140,.03) 0%, transparent 60%), radial-gradient(ellipse 35% 25% at 85% 70%, rgba(0,100,80,.03) 0%, transparent 60%)" }} />
-        <div style={{ position: "absolute", inset: 0, zIndex: 0,
-          backgroundImage: "linear-gradient(rgba(0,255,200,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,200,.02) 1px,transparent 1px)",
-          backgroundSize: "55px 55px",
-          maskImage: "radial-gradient(ellipse at center, black 25%, transparent 75%)" }} />
-        <Particles />
+      <StatusPanel
+        wallet={wallet}
+        campaignCount={campaignCount}
+        creatorCount={creatorCount}
+        totalRecipients={totalRecipients}
+        pendingDeployment={pendingDeployment}
+        createState={createState}
+        onNavigate={navigate}
+      />
 
-        <div className="hero-content" style={{ position: "relative", zIndex: 2 }}>
-          <div className="hero-eyebrow" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, letterSpacing: 3, color: "#00ddb0", border: "1px solid rgba(0,255,200,.22)", display: "inline-block", padding: "4px 14px", marginBottom: 28, animation: "fadeUp .8s .2s both" }}>
-            PRIVACY-PRESERVING PROTOCOL
-          </div>
-
-          <h1 className="hero-title" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: "clamp(46px,8vw,104px)", fontWeight: 400, lineHeight: .96, letterSpacing: 2, animation: "fadeUp .9s .4s both" }}>
-            <Glitch color="#ffffff">REWARDS_</Glitch><br />
-            <span style={{ color: "#ffffff" }}>WITHOUT</span><br />
-            <span style={{ color: "#00ffc8", display: "inline-block", animation: "glowPulse 3s 1.4s ease-in-out infinite" }}>
-              <Glitch color="#00ffc8">EXPOSURE_</Glitch>
-            </span>
-          </h1>
-
-          <TypewriterSub />
-
-          <div className="hero-actions" style={{ display: "flex", gap: 14, justifyContent: "center", flexWrap: "wrap", animation: "fadeUp .9s .8s both" }}>
-            <Btn className="hero-btn">BOOK DEMO</Btn>
-            <Btn className="hero-btn" outline>LAUNCH CAMPAIGN</Btn>
-          </div>
-        </div>
-      </section>
-
-      {/* ENCRYPTED BY DESIGN */}
-      <section className="content-section" style={{ padding: "90px 48px", maxWidth: 1100, margin: "0 auto" }}>
-        <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 2, marginBottom: 10 }}>ZRC_LAYER_LINE: 001</div>
-        <h2 style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: "clamp(20px,3.5vw,40px)", color: "#cce8e4", letterSpacing: 3, marginBottom: 8 }}>ENCRYPTED BY DESIGN.</h2>
-        <p style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", marginBottom: 40, lineHeight: 1.8 }}>
-          Powered by ZK Proofs and Private Transactions, providing trust without public transparency.
-        </p>
-        <div className="feature-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 16 }}>
-          <FeatCard tag="// CONFIDENTIAL_AIRDROP" title="DROP TO THE RIGHT WALLETS. TELL NO ONE ELSE." desc="Distribute tokens to verified holders without exposing the recipient list or individual balances." extra="+ MORE     ONLINE REWARDS >" delay={0} />
-          <FeatCard tag="// NATURAL_LANGUAGE_REWARDS" title="SET RULES IN PLAIN PROMPTS." desc="Define eligibility criteria using natural language — no smart contract expertise or coding required for deployment." delay={120} />
-          <FeatCard tag="// STEALTH_ADDRESSES" title="ONE-TIME ADDRESSES. ZERO TRACEABILITY." desc="Generate ephemeral stealth addresses using ZK tech so recipients can't be linked across transactions." extra="MAX SEND: 2D     AVAILABLE" delay={240} />
-        </div>
-      </section>
-
-      {/* HOW ZUS WORKS */}
-      <section className="content-section" style={{ padding: "90px 48px", maxWidth: 1100, margin: "0 auto" }}>
-        <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 2, marginBottom: 10 }}>ZRC_LAYER_LINE: 002</div>
-        <h2 style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: "clamp(20px,3.5vw,40px)", color: "#cce8e4", letterSpacing: 3, marginBottom: 4 }}>
-          HOW <span style={{ color: "#00ffc8", textShadow: "0 0 16px rgba(0,255,200,.4)" }}>ZUS</span> WORKS
-        </h2>
-        <div style={{ width: 36, height: 2, background: "#00ffc8", margin: "10px 0 40px", boxShadow: "0 0 8px #00ffc8" }} />
-        <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 640 }}>
-          <HowStep dot="S" title="PRIVATE BY DEFAULT" desc="Prove eligibility without revealing balances or activity. Our zero-knowledge infrastructure ensures your data footprint is non-existent." delay={0} />
-          <HowStep dot="P" title="WORKS WITH PAYMENTS" desc="Trigger rewards from real merchant checkouts. Bridge the gap between on-chain incentives and off-chain commerce seamlessly." delay={150} />
-          <HowStep dot="C" title="SMART CAMPAIGN LOGIC" desc="Define reward rules with flexible onchain intelligence. Programmatic loyalty that adapts to user behavior while maintaining total anonymity." delay={300} />
-        </div>
-      </section>
-
-      {/* OPERATIONAL USE CASES */}
-      <section className="content-section use-cases-section" style={{ padding: "90px 48px", textAlign: "center", position: "relative", overflow: "hidden" }}>
-        <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse 70% 60% at 50% 50%, rgba(0,255,200,.02) 0%, transparent 70%)", pointerEvents: "none" }} />
-        <div style={{ maxWidth: 1100, margin: "0 auto", position: "relative", zIndex: 1 }}>
-          <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 2, marginBottom: 10 }}>ZRC_LAYER_LINE: 003</div>
-          <h2 style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: "clamp(20px,3.5vw,40px)", color: "#cce8e4", letterSpacing: 4, marginBottom: 48 }}>
-            OPERATIONAL USE CASES
-          </h2>
-          <div className="use-cases-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, maxWidth: 700, margin: "0 auto" }}>
-            <UseCard title="VIP DISCOUNTS" desc="Offer exclusive price reductions to your top-tier customers without revealing their transaction history." delay={0} />
-            <UseCard title="CASHBACK CAMPAIGNS" desc="Automate reward rebates for verified purchases while maintaining absolute wallet confidentiality." delay={100} />
-            <UseCard title="TOKEN-HOLDER PERKS" desc="Unlock ecosystem benefits for asset holders without exposing their total portfolio balances." delay={200} />
-            <UseCard title="PRIVATE LOYALTY TIERS" desc="Classify users into status groups and trigger tailored rewards through anonymized proofs of activity." delay={300} />
-          </div>
-        </div>
-      </section>
-
-      {/* LEDGER OF SHADOWS */}
-      <section className="ledger-section" style={{ padding: "120px 24px", textAlign: "center", position: "relative", overflow: "hidden" }}>
-        <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse 55% 40% at 50% 50%, rgba(0,255,200,.035) 0%, transparent 70%)", pointerEvents: "none" }} />
-        <div style={{ maxWidth: 600, margin: "0 auto", position: "relative", zIndex: 1 }}>
-          <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 2, marginBottom: 16 }}>ZRC_LAYER_LINE: 004</div>
-          <h2 style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: "clamp(30px,6vw,68px)", color: "#cce8e4", letterSpacing: 3, lineHeight: 1.05, marginBottom: 20 }}>
-            THE LEDGER OF<br />SHADOWS.
-          </h2>
-          <p className="ledger-copy" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#3a6660", lineHeight: 2, marginBottom: 36 }}>
-            Start distributing rewards that respect the right to<br className="desktop-break" />
-            privacy. Join the next generation of protocol-level<br className="desktop-break" />
-            confidentiality.
-          </p>
-          <Btn className="hero-btn" outline>CREATE CAMPAIGN</Btn>
-        </div>
-      </section>
-
-      {/* FOOTER */}
-      <footer className="site-footer" style={{
-        borderTop: "1px solid rgba(0,255,200,.06)",
-        padding: "20px 40px",
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "#2a5550", letterSpacing: 1,
-      }}>
-        <div className="footer-brand" style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ color: "#00ffc8" }}>ZUS_PROTOCOL_CORE</span>
-          <PixelCat />
-        </div>
-        <div className="footer-copy" style={{ textAlign: "center", lineHeight: 2 }}>
-          <div>© 2025 ZUS PROTOCOL. ALL RIGHTS RESERVED.</div>
-          <div style={{ color: "#1a5550", fontSize: 8, letterSpacing: 2 }}>i like cats</div>
-        </div>
-        <span className="footer-links">PRIVACY · TERMS · DOCS</span>
-      </footer>
-    </>
+      {route === "campaigns" ? (
+        <CampaignsPage
+          campaigns={campaigns}
+          campaignsLoading={campaignsLoading}
+          campaignsError={campaignsError}
+          form={form}
+          wallet={wallet}
+          createState={createState}
+          pendingDeployment={pendingDeployment}
+          onFormChange={updateForm}
+          onRecipientChange={updateRecipient}
+          onAddRecipient={addRecipient}
+          onRemoveRecipient={removeRecipient}
+          onSubmitCreate={submitCreate}
+          onRefresh={() => setRefreshNonce((current) => current + 1)}
+        />
+      ) : (
+        <HomePage
+          campaigns={campaigns}
+          wallet={wallet}
+          onConnect={connectWallet}
+          onNavigate={navigate}
+        />
+      )}
+    </div>
   );
 }
