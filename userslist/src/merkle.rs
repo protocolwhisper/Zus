@@ -347,6 +347,7 @@ fn prepare_campaign(payload: CreateCampaignRequest) -> Result<PreparedCampaign, 
         campaign_id,
         summary: CampaignSummary {
             campaign_id: campaign_id.to_string(),
+            onchain_campaign_id: uuid_to_onchain_campaign_id(campaign_id),
             name: name.to_owned(),
             campaign_creator_address,
             merkle_root: merkle.root,
@@ -362,6 +363,7 @@ fn prepare_campaign(payload: CreateCampaignRequest) -> Result<PreparedCampaign, 
 fn campaign_summary_from_row(row: CampaignSummaryRow) -> Result<CampaignSummary, AppError> {
     Ok(CampaignSummary {
         campaign_id: row.campaign_id.to_string(),
+        onchain_campaign_id: uuid_to_onchain_campaign_id(row.campaign_id),
         name: row.name,
         campaign_creator_address: row.campaign_creator_address,
         merkle_root: row.merkle_root,
@@ -383,6 +385,7 @@ fn claim_payload_from_row(row: ClaimPayloadRow) -> Result<ClaimPayloadResponse, 
 
     Ok(ClaimPayloadResponse {
         campaign_id: row.campaign_id.to_string(),
+        onchain_campaign_id: uuid_to_onchain_campaign_id(row.campaign_id),
         name: row.name,
         campaign_creator_address: row.campaign_creator_address,
         leaf_address: row.leaf_address,
@@ -401,6 +404,10 @@ fn claim_payload_from_row(row: ClaimPayloadRow) -> Result<ClaimPayloadResponse, 
             tree_depth: TREE_DEPTH,
         },
     })
+}
+
+fn uuid_to_onchain_campaign_id(campaign_id: Uuid) -> String {
+    format!("0x{:0>64}", campaign_id.simple())
 }
 
 fn normalize_recipients(

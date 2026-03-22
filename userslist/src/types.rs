@@ -27,6 +27,7 @@ pub struct ClaimLookupRequest {
 #[derive(Debug, Serialize, Clone)]
 pub struct CampaignSummary {
     pub campaign_id: String,
+    pub onchain_campaign_id: String,
     pub name: String,
     pub campaign_creator_address: String,
     pub merkle_root: String,
@@ -54,6 +55,7 @@ pub struct NoirClaimInputs {
 #[derive(Debug, Serialize)]
 pub struct ClaimPayloadResponse {
     pub campaign_id: String,
+    pub onchain_campaign_id: String,
     pub name: String,
     pub campaign_creator_address: String,
     pub leaf_address: String,
