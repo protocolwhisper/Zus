@@ -60,10 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3000);
-    let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let address: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .map_err(|_| format!("HOST must be a valid IP address, received: {host}"))?;
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     println!("Merkle proof API listening on http://{}", address);
