@@ -2,15 +2,15 @@ use crate::{
     error::AppError,
     types::{
         CampaignSummary, ClaimLookupRequest, ClaimPayloadResponse, CreateCampaignRequest,
-        CreatorCampaignsResponse, HealthResponse, NoirClaimInputs, PreparedCampaign,
-        PreparedClaim, RecipientInput,
+        CreatorCampaignsResponse, HealthResponse, NoirClaimInputs, PreparedCampaign, PreparedClaim,
+        RecipientInput,
     },
 };
+use acir_field::{AcirField, FieldElement};
 use axum::{
     Json,
     extract::{Path, State},
 };
-use acir_field::{AcirField, FieldElement};
 use bn254_blackbox_solver::poseidon2_permutation;
 use num_bigint::BigUint;
 use sqlx::{FromRow, PgPool, types::Json as SqlJson};
@@ -80,6 +80,35 @@ pub async fn create_campaign(
     insert_campaign(&state.pool, &prepared).await?;
 
     Ok(Json(prepared.summary))
+}
+
+pub async fn list_campaigns(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<CampaignSummary>>, AppError> {
+    let rows = sqlx::query_as::<_, CampaignSummaryRow>(
+        r#"
+        SELECT
+            id AS campaign_id,
+            name,
+            campaign_creator_address,
+            merkle_root,
+            leaf_count,
+            depth,
+            hash_algorithm,
+            leaf_encoding
+        FROM campaigns
+        ORDER BY created_at DESC, name ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let campaigns = rows
+        .into_iter()
+        .map(campaign_summary_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(campaigns))
 }
 
 pub async fn get_campaign(
@@ -488,7 +517,10 @@ fn build_noir_merkle_artifacts(leaves: &[FieldElement]) -> Result<NoirMerkleArti
     })
 }
 
-fn poseidon2_hash_pair(left: &FieldElement, right: &FieldElement) -> Result<FieldElement, AppError> {
+fn poseidon2_hash_pair(
+    left: &FieldElement,
+    right: &FieldElement,
+) -> Result<FieldElement, AppError> {
     let two_pow_64 = FieldElement::from(18_446_744_073_709_551_616u128);
     let iv = FieldElement::from(2u128) * two_pow_64;
     let state = [*left, *right, FieldElement::zero(), iv];

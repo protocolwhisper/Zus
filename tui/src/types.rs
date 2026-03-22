@@ -141,7 +141,7 @@ impl App {
                     kind: ActionKind::GenerateZkWitness,
                     label: "Generate ZK Witness",
                     command_label: "write Prover.toml + nargo execute",
-                    description: "Use a saved Foundry wallet to derive its public key, fetch campaign claim inputs, auto-generate the MVP proof secrets locally, write the Noir prover file, and solve the witness for the stealthdrop circuit.",
+                    description: "Use a saved Foundry wallet to decrypt the real wallet secret locally, fetch campaign claim inputs, apply the TUI's fixed MVP Noir inputs, write the Noir prover file, and solve the witness for the stealthdrop circuit.",
                     fields: vec![
                         FormField {
                             key: "api_base_url",

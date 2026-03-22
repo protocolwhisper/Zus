@@ -19,8 +19,6 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use k256::{PublicKey, SecretKey, elliptic_curve::sec1::ToEncodedPoint};
-use rand::{RngCore, rngs::OsRng};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -52,6 +50,15 @@ const SMALL_LOGO: &[&str] = &[
 const HELP_TEXT: &str =
     "Up/Down: move  Tab/Left/Right: focus  Type: edit  Enter: run  Esc: clear output  q: quit";
 
+// Custom MVP wiring: the TUI injects fixed demo values for the Noir message/tweak so the
+// witness flow is predictable and easy to show end to end. Replace these with fresh per-claim
+// values before treating the flow as production-ready.
+const MVP_NOIR_MESSAGE: [u8; 8] = *b"ZUSMVP01";
+const MVP_NOIR_STEALTH_TWEAK: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 7,
+];
+
 struct CampaignLookupResult {
     campaign: ApiCampaignSummary,
     claim_status: ClaimStatus,
@@ -66,17 +73,12 @@ enum ClaimStatus {
 struct ResolvedWallet {
     account_label: String,
     address: String,
-    pub_key_x: [u8; 32],
-    pub_key_y: [u8; 32],
+    wallet_secret: [u8; 32],
 }
 
 struct AutoWitnessSecrets {
     message: [u8; 8],
     stealth_tweak: [u8; 32],
-    c_scalar: [u8; 32],
-    s_scalar: [u8; 32],
-    nullifier_x: [u8; 32],
-    nullifier_y: [u8; 32],
 }
 
 impl App {
@@ -760,6 +762,10 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
         "Stealth tweak: {}",
         bytes_to_hex(&secrets.stealth_tweak)
     );
+    let _ = writeln!(
+        output,
+        "MVP mode: using fixed TUI Noir inputs for message and stealth_tweak."
+    );
     let _ = writeln!(output);
     let _ = writeln!(
         output,
@@ -777,6 +783,10 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
     let _ = writeln!(
         output,
         "Note: the installed bb CLI still needs extra VK setup on this machine, so this action currently wires the proven path through Noir witness generation."
+    );
+    let _ = writeln!(
+        output,
+        "Circuit public outputs now include nullifier_x, nullifier_y, and stealth_address."
     );
 
     Ok(CommandResult {
@@ -815,16 +825,15 @@ fn resolve_wallet_for_zk(form: &ActionForm) -> AppResult<ResolvedWallet> {
         )));
     }
 
-    let public_key_result = run_cast_command(&build_saved_wallet_public_key_command(
+    let private_key_result = run_cast_command(&build_saved_wallet_private_key_command(
         &account_name,
         &keystore_path,
         &password,
     )?)?;
-    if !public_key_result.success {
-        return Err(AppError::message(format!(
-            "failed to resolve wallet public key from Foundry keystore: {}",
-            public_key_result.output.trim()
-        )));
+    if !private_key_result.success {
+        return Err(AppError::message(
+            "failed to decrypt wallet private key from Foundry keystore".to_string(),
+        ));
     }
 
     let address = extract_wallet_address(&address_result.output).ok_or_else(|| {
@@ -832,17 +841,12 @@ fn resolve_wallet_for_zk(form: &ActionForm) -> AppResult<ResolvedWallet> {
             "cast returned output, but I could not extract a wallet address from it.".to_string(),
         )
     })?;
-    let public_key_bytes = extract_public_key_bytes(&public_key_result.output)?;
+    let wallet_secret = extract_private_key_bytes(&private_key_result.output)?;
 
     Ok(ResolvedWallet {
         account_label: normalize_foundry_account_name(&account_name),
         address,
-        pub_key_x: public_key_bytes[..32]
-            .try_into()
-            .map_err(|_| AppError::message("failed to parse wallet public key x coordinate"))?,
-        pub_key_y: public_key_bytes[32..]
-            .try_into()
-            .map_err(|_| AppError::message("failed to parse wallet public key y coordinate"))?,
+        wallet_secret,
     })
 }
 
@@ -869,7 +873,6 @@ fn build_prover_toml_contents(
     secrets: &AutoWitnessSecrets,
 ) -> AppResult<String> {
     let mut prover = String::new();
-    prover.push_str(&format_u8_array_toml("c", &secrets.c_scalar));
     prover.push_str(&format_field_scalar_toml(
         "eligible_index",
         &claim.noir_inputs.eligible_index,
@@ -883,15 +886,11 @@ fn build_prover_toml_contents(
         &claim.noir_inputs.eligible_root,
     ));
     prover.push_str(&format_u8_array_toml("message", &secrets.message));
-    prover.push_str(&format_u8_array_toml("nullifier_x", &secrets.nullifier_x));
-    prover.push_str(&format_u8_array_toml("nullifier_y", &secrets.nullifier_y));
-    prover.push_str(&format_u8_array_toml("pub_key_x", &wallet.pub_key_x));
-    prover.push_str(&format_u8_array_toml("pub_key_y", &wallet.pub_key_y));
-    prover.push_str(&format_u8_array_toml("s", &secrets.s_scalar));
     prover.push_str(&format_u8_array_toml(
         "stealth_tweak",
         &secrets.stealth_tweak,
     ));
+    prover.push_str(&format_u8_array_toml("wallet_secret", &wallet.wallet_secret));
     Ok(prover)
 }
 
@@ -972,12 +971,12 @@ fn build_saved_wallet_address_command(
     ))
 }
 
-fn build_saved_wallet_public_key_command(
+fn build_saved_wallet_private_key_command(
     account_name: &str,
     keystore_path: &str,
     password: &str,
 ) -> AppResult<Vec<String>> {
-    let mut args = vec!["wallet".to_string(), "public-key".to_string()];
+    let mut args = vec!["wallet".to_string(), "private-key".to_string()];
 
     if !keystore_path.is_empty() {
         if password.is_empty() {
@@ -1067,24 +1066,17 @@ fn normalize_foundry_account_name(raw: &str) -> String {
         .to_string()
 }
 
-fn extract_public_key_bytes(output: &str) -> AppResult<[u8; 64]> {
+fn extract_private_key_bytes(output: &str) -> AppResult<[u8; 32]> {
     let raw = output
         .lines()
         .map(str::trim)
         .find(|line| line.starts_with("0x"))
-        .ok_or_else(|| AppError::message("could not find a public key in cast output"))?;
+        .ok_or_else(|| AppError::message("could not find a private key in cast output"))?;
 
-    let trimmed = raw.trim_start_matches("0x");
-    let without_prefix = if trimmed.len() == 130 && trimmed.starts_with("04") {
-        &trimmed[2..]
-    } else {
-        trimmed
-    };
-
-    let bytes = parse_hex_bytes(without_prefix, 64, "Public key")?;
+    let bytes = parse_hex_bytes(raw, 32, "Private key")?;
     bytes
         .try_into()
-        .map_err(|_| AppError::message("public key must decode to exactly 64 bytes".to_string()))
+        .map_err(|_| AppError::message("private key must decode to exactly 32 bytes".to_string()))
 }
 
 fn parse_hex_bytes(raw: &str, expected_len: usize, label: &str) -> AppResult<Vec<u8>> {
@@ -1137,42 +1129,10 @@ fn format_field_scalar_toml(name: &str, value: &str) -> String {
 }
 
 fn generate_auto_witness_secrets() -> AppResult<AutoWitnessSecrets> {
-    let mut rng = OsRng;
-
-    let mut message = [0_u8; 8];
-    rng.fill_bytes(&mut message);
-
-    let stealth_tweak = secret_key_bytes();
-    let c_scalar = secret_key_bytes();
-    let s_scalar = secret_key_bytes();
-    let nullifier_secret = SecretKey::random(&mut rng);
-    let nullifier_public = PublicKey::from_secret_scalar(&nullifier_secret.to_nonzero_scalar());
-    let encoded = nullifier_public.to_encoded_point(false);
-    let x = encoded
-        .x()
-        .ok_or_else(|| AppError::message("failed to derive nullifier x coordinate"))?;
-    let y = encoded
-        .y()
-        .ok_or_else(|| AppError::message("failed to derive nullifier y coordinate"))?;
-    let mut nullifier_x = [0_u8; 32];
-    let mut nullifier_y = [0_u8; 32];
-    nullifier_x.copy_from_slice(x);
-    nullifier_y.copy_from_slice(y);
-
     Ok(AutoWitnessSecrets {
-        message,
-        stealth_tweak,
-        c_scalar,
-        s_scalar,
-        nullifier_x,
-        nullifier_y,
+        message: MVP_NOIR_MESSAGE,
+        stealth_tweak: MVP_NOIR_STEALTH_TWEAK,
     })
-}
-
-fn secret_key_bytes() -> [u8; 32] {
-    let mut rng = OsRng;
-    let secret = SecretKey::random(&mut rng);
-    secret.to_bytes().into()
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -1371,7 +1331,7 @@ fn format_campaign_lookup_output(
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Wallet-side Noir fields still come from your ratatui wallet flow: pub_key_x, pub_key_y, c, s, nullifier_x, nullifier_y, stealth_tweak, message."
+        "Wallet-side Noir fields now come from your ratatui wallet flow as: wallet_secret, stealth_tweak, message. The circuit derives the pubkey and nullifier itself."
     );
 
     for (index, lookup) in lookups.iter().enumerate() {

@@ -5,7 +5,7 @@ mod types;
 
 use crate::merkle::{
     AppState, create_campaign, get_campaign, get_claim_payload_by_body, get_claim_payload_by_path,
-    health, list_creator_campaigns,
+    health, list_campaigns, list_creator_campaigns,
 };
 use crate::postgres::init_db;
 use axum::{
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState { pool });
     let app = Router::new()
         .route("/health", get(health))
-        .route("/campaigns", post(create_campaign))
+        .route("/campaigns", get(list_campaigns).post(create_campaign))
         .route("/campaigns/:campaign_id", get(get_campaign))
         .route(
             "/campaigns/:campaign_id/claim",

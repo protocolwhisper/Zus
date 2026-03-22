@@ -1,4 +1,4 @@
-use bignum::{BigNum, Secp256k1_Fq as Secp256k1Fq, Secp256k1_Fr as Secp256k1Fr};
+use bignum::{BigNum, Secp256k1_Fr as Secp256k1Fr};
 use keccak256::keccak256;
 use noir_bigcurve::BigCurve;
 use noir_bigcurve::curves::secp256k1::{Secp256k1, Secp256k1Scalar};
@@ -8,6 +8,12 @@ use trees::types::{MT_Creator, MembershipProver};
 
 global DEPTH: u32 = 12;
 global COMPRESSED_SIZE_BYTES: u32 = 33;
+
+struct ClaimOutputs {
+    nullifier_x: [u8; 32],
+    nullifier_y: [u8; 32],
+    stealth_address: Field,
+}
 
 fn hasher(leaves: [Field; 2]) -> Field {
     hash(leaves, 2)
@@ -41,18 +47,13 @@ fn plume_message<let L: u32>(message: [u8; L], pubkey: Secp256k1) -> [u8; L + CO
     result
 }
 
-fn verify_plume_v2<let L: u32>(
+fn derive_nullifier<let L: u32>(
     message: [u8; L],
-    c: Secp256k1Scalar,
-    s: Secp256k1Scalar,
+    wallet_scalar: Secp256k1Scalar,
     pubkey: Secp256k1,
-    nullifier: Secp256k1,
-) {
-    let s_point = Secp256k1::one().mul(s);
-    let _r_point = s_point - pubkey.mul(c);
-
+) -> Secp256k1 {
     let h = Secp256k1::hash_to_curve(plume_message(message, pubkey));
-    let _hashed_to_curve_r = h.mul(s) - nullifier.mul(c);
+    h.mul(wallet_scalar)
 }
 
 fn to_eth_address(pub_key_x: [u8; 32], pub_key_y: [u8; 32]) -> Field {
@@ -92,40 +93,30 @@ fn derive_stealth_address(
 }
 
 fn main(
-    pub_key_x: [u8; 32],
-    pub_key_y: [u8; 32],
+    wallet_secret: [u8; 32],
     stealth_tweak: [u8; 32],
     message: pub [u8; 8],
-    c: [u8; 32],
-    s: [u8; 32],
-    nullifier_x: pub [u8; 32],
-    nullifier_y: pub [u8; 32],
     eligible_root: pub Field,
     eligible_path: [Field; DEPTH],
     eligible_index: Field,
-) -> pub Field {
-    let scalar_c = Secp256k1Scalar::from_bignum(Secp256k1Fr::from_be_bytes(c));
-    let scalar_s = Secp256k1Scalar::from_bignum(Secp256k1Fr::from_be_bytes(s));
+) -> pub ClaimOutputs {
+    let wallet_scalar =
+        Secp256k1Scalar::from_bignum(Secp256k1Fr::from_be_bytes(wallet_secret));
     let stealth_scalar = Secp256k1Scalar::from_bignum(Secp256k1Fr::from_be_bytes(stealth_tweak));
 
-    let pubkey = Secp256k1 {
-        x: Secp256k1Fq::from_be_bytes(pub_key_x),
-        y: Secp256k1Fq::from_be_bytes(pub_key_y),
-        is_infinity: false,
-    };
+    let pubkey = Secp256k1::one().mul(wallet_scalar);
+    assert(pubkey.is_infinity == false);
+    let nullifier = derive_nullifier(message, wallet_scalar, pubkey);
+    assert(nullifier.is_infinity == false);
 
-    let nullifier = Secp256k1 {
-        x: Secp256k1Fq::from_be_bytes(nullifier_x),
-        y: Secp256k1Fq::from_be_bytes(nullifier_y),
-        is_infinity: false,
-    };
-
-    verify_plume_v2(message, scalar_c, scalar_s, pubkey, nullifier);
-
-    let address = to_eth_address(pub_key_x, pub_key_y);
+    let address = to_eth_address(pubkey.x.to_be_bytes(), pubkey.y.to_be_bytes());
 
     let mt = MerkleTree::from(eligible_root, hasher);
     mt.membership(address, eligible_index, eligible_path);
 
-    derive_stealth_address(pubkey, stealth_scalar, address)
+    ClaimOutputs {
+        nullifier_x: nullifier.x.to_be_bytes(),
+        nullifier_y: nullifier.y.to_be_bytes(),
+        stealth_address: derive_stealth_address(pubkey, stealth_scalar, address),
+    }
 }
