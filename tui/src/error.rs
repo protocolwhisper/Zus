@@ -20,6 +20,12 @@ pub enum AppError {
         #[source]
         source: io::Error,
     },
+    #[error("{context}")]
+    Http {
+        context: String,
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
 impl AppError {
@@ -37,6 +43,13 @@ impl AppError {
     pub fn command_launch(command: impl Into<String>, source: io::Error) -> Self {
         Self::CommandLaunch {
             command: command.into(),
+            source,
+        }
+    }
+
+    pub fn http(context: impl Into<String>, source: reqwest::Error) -> Self {
+        Self::Http {
+            context: context.into(),
             source,
         }
     }

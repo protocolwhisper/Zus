@@ -1,6 +1,7 @@
 use std::io::Stdout;
 
 use ratatui::{Terminal, backend::CrosstermBackend};
+use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -8,8 +9,10 @@ pub enum Focus {
     Fields,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionKind {
+    CampaignExplorer,
+    ListAccounts,
     CheckAddress,
     CreateWallet,
     ImportWallet,
@@ -50,6 +53,43 @@ pub struct CommandResult {
     pub success: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiCampaignSummary {
+    pub campaign_id: String,
+    pub name: String,
+    pub campaign_creator_address: String,
+    pub merkle_root: String,
+    pub leaf_count: usize,
+    pub depth: usize,
+    pub hash_algorithm: String,
+    pub leaf_encoding: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiNoirClaimInputs {
+    pub eligible_root: String,
+    pub eligible_path: Vec<String>,
+    pub eligible_index: String,
+    pub leaf_value: String,
+    pub tree_depth: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiClaimPayload {
+    pub campaign_id: String,
+    pub name: String,
+    pub campaign_creator_address: String,
+    pub leaf_address: String,
+    pub amount: String,
+    pub index: usize,
+    pub leaf_value: String,
+    pub proof: Vec<String>,
+    pub merkle_root: String,
+    pub hash_algorithm: String,
+    pub leaf_encoding: String,
+    pub noir_inputs: ApiNoirClaimInputs,
+}
+
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 impl App {
@@ -57,24 +97,104 @@ impl App {
         Self {
             forms: vec![
                 ActionForm {
+                    kind: ActionKind::CampaignExplorer,
+                    label: "Campaign Explorer",
+                    command_label: "GET /campaigns (+ optional claim lookup)",
+                    description: "Show every campaign from the proof API. The wallet field accepts either a direct 0x address or a saved Foundry account name from the default keystore directory. Add the keystore password when using a saved wallet.",
+                    fields: vec![
+                        FormField {
+                            key: "api_base_url",
+                            label: "API Base URL",
+                            hint: "http://127.0.0.1:3000",
+                            value: "http://127.0.0.1:3000".to_string(),
+                            sensitive: false,
+                            required: true,
+                        },
+                        FormField {
+                            key: "wallet_address",
+                            label: "Wallet / Account",
+                            hint: "optional: 0x... or saved Foundry account",
+                            value: String::new(),
+                            sensitive: false,
+                            required: false,
+                        },
+                        FormField {
+                            key: "password",
+                            label: "Keystore Password",
+                            hint: "required for saved account or keystore path",
+                            value: String::new(),
+                            sensitive: true,
+                            required: false,
+                        },
+                        FormField {
+                            key: "keystore_path",
+                            label: "Keystore Path",
+                            hint: "optional: explicit keystore file path",
+                            value: String::new(),
+                            sensitive: false,
+                            required: false,
+                        },
+                    ],
+                },
+                ActionForm {
+                    kind: ActionKind::ListAccounts,
+                    label: "Saved Key Pairs",
+                    command_label: "cast wallet list",
+                    description: "List saved Foundry keystore accounts so you can choose one by name for Campaign Explorer or Check Address.",
+                    fields: vec![FormField {
+                        key: "keystore_dir",
+                        label: "Keystore Dir",
+                        hint: "~/.foundry/keystores",
+                        value: String::new(),
+                        sensitive: false,
+                        required: false,
+                    }],
+                },
+                ActionForm {
                     kind: ActionKind::CheckAddress,
                     label: "Check Address",
                     command_label: "cast wallet address",
-                    description: "Paste a private key and derive the wallet address with Foundry.",
-                    fields: vec![FormField {
-                        key: "private_key",
-                        label: "Private Key",
-                        hint: "paste your private key here",
-                        value: String::new(),
-                        sensitive: true,
-                        required: true,
-                    }],
+                    description: "Derive the public wallet address from either a raw private key, a saved account name, or a keystore file. Add the keystore password when using a saved wallet.",
+                    fields: vec![
+                        FormField {
+                            key: "private_key",
+                            label: "Private Key",
+                            hint: "optional if using saved account",
+                            value: String::new(),
+                            sensitive: true,
+                            required: false,
+                        },
+                        FormField {
+                            key: "account_name",
+                            label: "Saved Account",
+                            hint: "optional: account in default keystore dir",
+                            value: String::new(),
+                            sensitive: false,
+                            required: false,
+                        },
+                        FormField {
+                            key: "password",
+                            label: "Keystore Password",
+                            hint: "required for saved account or keystore path",
+                            value: String::new(),
+                            sensitive: true,
+                            required: false,
+                        },
+                        FormField {
+                            key: "keystore_path",
+                            label: "Keystore Path",
+                            hint: "optional: path to a keystore file",
+                            value: String::new(),
+                            sensitive: false,
+                            required: false,
+                        },
+                    ],
                 },
                 ActionForm {
                     kind: ActionKind::CreateWallet,
                     label: "Create New",
                     command_label: "cast wallet new",
-                    description: "Generate a new wallet. Add password plus account name to save it as a Foundry keystore.",
+                    description: "Generate a new wallet. Leave the save fields blank for an unsaved keypair, or add a password plus account name/keystore dir to store it in Foundry.",
                     fields: vec![
                         FormField {
                             key: "account_name",
@@ -155,9 +275,9 @@ impl App {
             selected_field: 0,
             focus: Focus::Actions,
             output:
-                "Yes, this is possible. Pick a flow on the left, fill the fields, then press Enter."
+                "Campaign Explorer can check claimability with a wallet address or one of your saved Foundry accounts. Use Saved Key Pairs to list account names first."
                     .to_string(),
-            last_command: "cast wallet address --private-key <PRIVATE_KEY>".to_string(),
+            last_command: "GET http://127.0.0.1:3000/campaigns".to_string(),
             status: "Ready".to_string(),
         }
     }
@@ -234,6 +354,26 @@ impl App {
     pub fn clear_output(&mut self) {
         self.output.clear();
         self.status = "Output cleared".to_string();
+    }
+
+    pub fn set_form_field_value(&mut self, kind: ActionKind, key: &str, value: String) {
+        if let Some(form) = self.forms.iter_mut().find(|form| form.kind == kind) {
+            if let Some(field) = form.fields.iter_mut().find(|field| field.key == key) {
+                field.value = value;
+            }
+        }
+    }
+
+    pub fn select_field_by_key(&mut self, key: &str) {
+        if let Some(index) = self
+            .current_form()
+            .fields
+            .iter()
+            .position(|field| field.key == key)
+        {
+            self.selected_field = index;
+            self.focus = Focus::Fields;
+        }
     }
 }
 

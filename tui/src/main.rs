@@ -1,10 +1,18 @@
 mod error;
 mod types;
 
-use std::{env, io, process::Command, time::Duration};
+use std::fmt::Write as _;
+use std::{
+    env, io,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use crate::error::{AppError, AppResult};
-use crate::types::{ActionForm, ActionKind, App, AppTerminal, CommandResult, Focus};
+use crate::types::{
+    ActionForm, ActionKind, ApiCampaignSummary, ApiClaimPayload, App, AppTerminal, CommandResult,
+    Focus,
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -19,6 +27,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap},
 };
+use reqwest::{StatusCode, blocking::Client};
 
 const LOGO: &[&str] = &[
     "███████╗██╗   ██╗███████╗",
@@ -40,29 +49,82 @@ const SMALL_LOGO: &[&str] = &[
 const HELP_TEXT: &str =
     "Up/Down: move  Tab/Left/Right: focus  Type: edit  Enter: run  Esc: clear output  q: quit";
 
+struct CampaignLookupResult {
+    campaign: ApiCampaignSummary,
+    claim_status: ClaimStatus,
+}
+
+enum ClaimStatus {
+    Eligible(ApiClaimPayload),
+    Missing,
+    Error(String),
+}
+
 impl App {
     fn run(&mut self) {
-        match build_command(self.current_form()) {
-            Ok(args) => match run_cast_command(&args) {
-                Ok(result) => {
-                    self.last_command = result.command_preview;
-                    self.output = result.output;
-                    self.status = if result.success {
-                        "Command finished".to_string()
-                    } else {
-                        "cast wallet returned a non-zero status".to_string()
-                    };
+        let action_kind = self.current_form().kind;
+        let create_wallet_saves_to_keystore = action_kind == ActionKind::CreateWallet
+            && create_wallet_should_save(self.current_form());
+
+        match execute_action(self.current_form()) {
+            Ok(result) => {
+                let auto_filled_address = if matches!(
+                    action_kind,
+                    ActionKind::CheckAddress | ActionKind::CreateWallet
+                ) && result.success
+                {
+                    extract_wallet_address(&result.output)
+                } else {
+                    None
+                };
+
+                self.last_command = result.command_preview;
+                self.output = if action_kind == ActionKind::ListAccounts && result.success {
+                    format_saved_accounts_output(&result.output)
+                } else {
+                    result.output
+                };
+                self.status = if result.success {
+                    "Completed".to_string()
+                } else {
+                    "Completed with issues".to_string()
+                };
+
+                if let Some(address) = auto_filled_address {
+                    self.set_form_field_value(
+                        ActionKind::CampaignExplorer,
+                        "wallet_address",
+                        address,
+                    );
+                    self.status = "Completed and copied address into Campaign Explorer".to_string();
                 }
-                Err(err) => {
-                    self.last_command = format!("cast {}", args.join(" "));
-                    self.output = err.to_string();
-                    self.status = "Failed to launch cast".to_string();
+
+                if action_kind == ActionKind::CreateWallet
+                    && result.success
+                    && !create_wallet_saves_to_keystore
+                {
+                    self.output.push_str(
+                        "\n\nNot saved: this keypair was only printed to the output. Add a password plus account name or keystore dir if you want Foundry to store it.",
+                    );
+                    self.status = "Completed, but the new wallet was not saved".to_string();
                 }
-            },
-            Err(err) => {
-                self.output = err.to_string();
-                self.status = "Missing or invalid input".to_string();
             }
+            Err(err) => {
+                self.last_command = fallback_command_preview(self.current_form());
+                self.output = err.to_string();
+                self.status = "Request failed".to_string();
+                focus_fields_for_error(self, &err.to_string());
+            }
+        }
+    }
+}
+
+fn execute_action(form: &ActionForm) -> AppResult<CommandResult> {
+    match form.kind {
+        ActionKind::CampaignExplorer => run_campaign_lookup(form),
+        _ => {
+            let args = build_command(form)?;
+            run_cast_command(&args)
         }
     }
 }
@@ -169,6 +231,14 @@ fn render_hero(frame: &mut Frame, area: Rect, compact: bool) {
     );
 
     let logo_lines = if compact { SMALL_LOGO } else { LOGO };
+    let [_, logo_area, _] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(logo_lines.len() as u16),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
     let logo = Paragraph::new(Text::from(
         logo_lines
             .iter()
@@ -190,7 +260,7 @@ fn render_hero(frame: &mut Frame, area: Rect, compact: bool) {
             .collect::<Vec<_>>(),
     ))
     .alignment(Alignment::Center);
-    frame.render_widget(logo, inner);
+    frame.render_widget(logo, logo_area);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
@@ -317,7 +387,7 @@ fn render_fields(frame: &mut Frame, area: Rect, app: &App) {
             let value = if field.value.is_empty() {
                 field.hint.to_string()
             } else if field.sensitive {
-                "*".repeat(field.value.chars().count().max(4))
+                mask_sensitive_value(&field.value)
             } else {
                 field.value.clone()
             };
@@ -365,7 +435,7 @@ fn render_fields(frame: &mut Frame, area: Rect, app: &App) {
             let cursor_content = if field.value.is_empty() {
                 String::new()
             } else if field.sensitive {
-                "*".repeat(field.value.chars().count().max(4))
+                mask_sensitive_value(&field.value)
             } else {
                 field.value.clone()
             };
@@ -379,6 +449,10 @@ fn render_fields(frame: &mut Frame, area: Rect, app: &App) {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+fn mask_sensitive_value(value: &str) -> String {
+    "*".repeat(value.chars().count())
 }
 
 fn render_output(frame: &mut Frame, area: Rect, app: &App) {
@@ -413,15 +487,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn build_command(form: &ActionForm) -> AppResult<Vec<String>> {
     match form.kind {
-        ActionKind::CheckAddress => {
-            let private_key = required_value(form, "private_key", "Private key is required.")?;
-            Ok(vec![
-                "wallet".to_string(),
-                "address".to_string(),
-                "--private-key".to_string(),
-                private_key,
-            ])
+        ActionKind::CampaignExplorer => Err(AppError::message(
+            "Campaign Explorer is handled through the proof API, not cast.",
+        )),
+        ActionKind::ListAccounts => {
+            let keystore_dir = normalize_path(form.value("keystore_dir"));
+            let mut args = vec!["wallet".to_string(), "list".to_string()];
+            if !keystore_dir.is_empty() {
+                args.push("--dir".to_string());
+                args.push(keystore_dir);
+            }
+            Ok(args)
         }
+        ActionKind::CheckAddress => build_wallet_address_command(form),
         ActionKind::CreateWallet => {
             let account_name = form.value("account_name");
             let keystore_dir = normalize_path(form.value("keystore_dir"));
@@ -488,6 +566,68 @@ fn build_command(form: &ActionForm) -> AppResult<Vec<String>> {
     }
 }
 
+fn fallback_command_preview(form: &ActionForm) -> String {
+    match form.kind {
+        ActionKind::CampaignExplorer => {
+            let api_base = normalize_api_base_url(form.value("api_base_url"))
+                .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+            format!("GET {api_base}/campaigns")
+        }
+        _ => form.command_label.to_string(),
+    }
+}
+
+fn create_wallet_should_save(form: &ActionForm) -> bool {
+    !form.value("account_name").is_empty()
+        || !form.value("keystore_dir").is_empty()
+        || !form.value("password").is_empty()
+}
+
+fn focus_fields_for_error(app: &mut App, message: &str) {
+    let lowered = message.to_ascii_lowercase();
+    let key = if lowered.contains("api base url") {
+        Some("api_base_url")
+    } else if lowered.contains("wallet address") {
+        Some("wallet_address")
+    } else if lowered.contains("saved account") || lowered.contains("account name") {
+        Some("account_name")
+    } else if lowered.contains("keystore path") {
+        Some("keystore_path")
+    } else if lowered.contains("keystore dir") {
+        Some("keystore_dir")
+    } else if lowered.contains("password") {
+        Some("password")
+    } else if lowered.contains("private key") {
+        Some("private_key")
+    } else if lowered.contains("number") {
+        Some("number")
+    } else {
+        app.current_form().fields.first().map(|field| field.key)
+    };
+
+    if let Some(key) = key {
+        app.select_field_by_key(key);
+    } else {
+        app.move_focus_right();
+    }
+}
+
+fn build_wallet_address_command(form: &ActionForm) -> AppResult<Vec<String>> {
+    let private_key = form.value("private_key");
+    let account_name = form.value("account_name");
+    let password = form.value("password");
+    let keystore_path = normalize_path(form.value("keystore_path"));
+
+    let mut args = vec!["wallet".to_string(), "address".to_string()];
+    if !private_key.is_empty() {
+        args.push("--private-key".to_string());
+        args.push(private_key.to_string());
+        return Ok(args);
+    }
+
+    build_saved_wallet_address_command(account_name, &keystore_path, password)
+}
+
 fn required_value(form: &ActionForm, key: &str, message: &str) -> AppResult<String> {
     let value = form.value(key);
     if value.is_empty() {
@@ -496,11 +636,389 @@ fn required_value(form: &ActionForm, key: &str, message: &str) -> AppResult<Stri
     Ok(value.to_string())
 }
 
+fn run_campaign_lookup(form: &ActionForm) -> AppResult<CommandResult> {
+    let api_base = normalize_api_base_url(&required_value(
+        form,
+        "api_base_url",
+        "API base URL is required.",
+    )?)?;
+    let campaigns_url = format!("{api_base}/campaigns");
+    let wallet_address = resolve_campaign_wallet_address(form)?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|source| AppError::http("failed to build the proof API client", source))?;
+
+    let campaigns_response = client
+        .get(&campaigns_url)
+        .send()
+        .map_err(|source| AppError::http(format!("failed to fetch {campaigns_url}"), source))?;
+    let campaigns =
+        parse_json_response::<Vec<ApiCampaignSummary>>(campaigns_response, &campaigns_url)?;
+
+    if let Some(address) = wallet_address.as_deref() {
+        let lookups = campaigns
+            .into_iter()
+            .map(|campaign| lookup_claim_for_campaign(&client, &api_base, address, campaign))
+            .collect::<Vec<_>>();
+        let has_errors = lookups
+            .iter()
+            .any(|lookup| matches!(lookup.claim_status, ClaimStatus::Error(_)));
+
+        Ok(CommandResult {
+            command_preview: format!("GET {campaigns_url} + claim lookups for {address}"),
+            output: format_campaign_lookup_output(&api_base, address, &lookups),
+            success: !has_errors,
+        })
+    } else {
+        Ok(CommandResult {
+            command_preview: format!("GET {campaigns_url}"),
+            output: format_campaign_catalog_output(&api_base, &campaigns),
+            success: true,
+        })
+    }
+}
+
+fn resolve_campaign_wallet_address(form: &ActionForm) -> AppResult<Option<String>> {
+    let wallet_identifier = form.value("wallet_address");
+    let password = form.value("password");
+    let keystore_path = normalize_path(form.value("keystore_path"));
+
+    if wallet_identifier.is_empty() && keystore_path.is_empty() {
+        return Ok(None);
+    }
+
+    if !wallet_identifier.is_empty() {
+        if let Ok(address) = normalize_wallet_address(wallet_identifier) {
+            return Ok(Some(address));
+        }
+    }
+
+    let args = build_saved_wallet_address_command(wallet_identifier, &keystore_path, password)?;
+    let result = run_cast_command(&args)?;
+    if !result.success {
+        return Err(AppError::message(format!(
+            "failed to resolve wallet address from Foundry account or keystore: {}",
+            result.output.trim()
+        )));
+    }
+
+    extract_wallet_address(&result.output)
+        .ok_or_else(|| {
+            AppError::message(
+                "cast returned output, but I could not extract a wallet address from it."
+                    .to_string(),
+            )
+        })
+        .map(Some)
+}
+
+fn build_saved_wallet_address_command(
+    account_name: &str,
+    keystore_path: &str,
+    password: &str,
+) -> AppResult<Vec<String>> {
+    let mut args = vec!["wallet".to_string(), "address".to_string()];
+
+    if !keystore_path.is_empty() {
+        if password.is_empty() {
+            return Err(AppError::message(
+                "Password is required for a saved Foundry account or keystore path.",
+            ));
+        }
+        args.push("--keystore".to_string());
+        args.push(keystore_path.to_string());
+        args.push("--password".to_string());
+        args.push(password.to_string());
+        return Ok(args);
+    }
+
+    if !account_name.is_empty() {
+        let normalized_account_name = normalize_foundry_account_name(account_name);
+        if password.is_empty() {
+            return Err(AppError::message(
+                "Password is required for a saved Foundry account or keystore path.",
+            ));
+        }
+        args.push("--keystore".to_string());
+        args.push(format!(
+            "{}/{}",
+            default_foundry_keystore_dir(),
+            normalized_account_name
+        ));
+        args.push("--password".to_string());
+        args.push(password.to_string());
+        return Ok(args);
+    }
+
+    Err(AppError::message(
+        "Provide a private key, a saved account name, or a keystore path.",
+    ))
+}
+
+fn normalize_api_base_url(raw: &str) -> AppResult<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(AppError::message("API base URL is required."));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_wallet_address(raw: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 42 || !trimmed.starts_with("0x") {
+        return Err(AppError::message(format!(
+            "Wallet address must look like 0x followed by 40 hex characters: {trimmed}"
+        )));
+    }
+
+    if !trimmed[2..]
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(AppError::message(format!(
+            "Wallet address contains non-hex characters: {trimmed}"
+        )));
+    }
+
+    Ok(format!("0x{}", trimmed[2..].to_ascii_lowercase()))
+}
+
+fn normalize_foundry_account_name(raw: &str) -> String {
+    raw.trim()
+        .strip_suffix(" (Local)")
+        .unwrap_or(raw.trim())
+        .trim()
+        .to_string()
+}
+
+fn format_saved_accounts_output(output: &str) -> String {
+    let accounts = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(normalize_foundry_account_name)
+        .collect::<Vec<_>>();
+
+    if accounts.is_empty() {
+        return "(no saved Foundry accounts found)".to_string();
+    }
+
+    let mut formatted = String::from("Paste one of these names into Wallet / Account:\n");
+    for account in accounts {
+        let _ = writeln!(formatted, "- {account}");
+    }
+    formatted
+}
+
+fn extract_wallet_address(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            let candidate = token.trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | ',' | ';' | '(' | ')')
+            });
+            normalize_wallet_address(candidate).ok()
+        })
+    })
+}
+
+fn parse_json_response<T>(response: reqwest::blocking::Response, url: &str) -> AppResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_response_body(response);
+        return Err(AppError::message(format!(
+            "proof API returned {status} for {url}{}",
+            format_response_body_suffix(&body)
+        )));
+    }
+
+    response
+        .json::<T>()
+        .map_err(|source| AppError::http(format!("failed to decode JSON from {url}"), source))
+}
+
+fn read_response_body(response: reqwest::blocking::Response) -> String {
+    response.text().unwrap_or_default()
+}
+
+fn format_response_body_suffix(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        let single_line = trimmed.lines().next().unwrap_or(trimmed);
+        format!(" | {single_line}")
+    }
+}
+
+fn lookup_claim_for_campaign(
+    client: &Client,
+    api_base: &str,
+    wallet_address: &str,
+    campaign: ApiCampaignSummary,
+) -> CampaignLookupResult {
+    let claim_url = format!(
+        "{api_base}/campaigns/{}/claim/{}",
+        campaign.campaign_id, wallet_address
+    );
+
+    let claim_status = match client.get(&claim_url).send() {
+        Ok(response) => match response.status() {
+            status if status.is_success() => match response.json::<ApiClaimPayload>() {
+                Ok(claim) => ClaimStatus::Eligible(claim),
+                Err(error) => ClaimStatus::Error(format!(
+                    "failed to decode claim JSON from {claim_url}: {error}"
+                )),
+            },
+            StatusCode::NOT_FOUND => ClaimStatus::Missing,
+            status => {
+                let body = read_response_body(response);
+                ClaimStatus::Error(format!(
+                    "claim lookup returned {status}{}",
+                    format_response_body_suffix(&body)
+                ))
+            }
+        },
+        Err(error) => ClaimStatus::Error(format!("request failed: {error}")),
+    };
+
+    CampaignLookupResult {
+        campaign,
+        claim_status,
+    }
+}
+
+fn format_campaign_catalog_output(api_base: &str, campaigns: &[ApiCampaignSummary]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "API base: {api_base}");
+    let _ = writeln!(output, "Campaigns loaded: {}", campaigns.len());
+
+    if campaigns.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "No campaigns were returned by the proof API.");
+        return output;
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Add a wallet address and press Enter again to fetch Noir claim inputs per campaign."
+    );
+
+    for (index, campaign) in campaigns.iter().enumerate() {
+        write_campaign_header(&mut output, index, campaign);
+        let _ = writeln!(output, "status: catalog only");
+        let _ = writeln!(output);
+    }
+
+    output
+}
+
+fn format_campaign_lookup_output(
+    api_base: &str,
+    wallet_address: &str,
+    lookups: &[CampaignLookupResult],
+) -> String {
+    let mut output = String::new();
+    let eligible_count = lookups
+        .iter()
+        .filter(|lookup| matches!(lookup.claim_status, ClaimStatus::Eligible(_)))
+        .count();
+    let missing_count = lookups
+        .iter()
+        .filter(|lookup| matches!(lookup.claim_status, ClaimStatus::Missing))
+        .count();
+    let error_count = lookups
+        .iter()
+        .filter(|lookup| matches!(lookup.claim_status, ClaimStatus::Error(_)))
+        .count();
+
+    let _ = writeln!(output, "API base: {api_base}");
+    let _ = writeln!(output, "Wallet address: {wallet_address}");
+    let _ = writeln!(output, "Campaigns loaded: {}", lookups.len());
+    let _ = writeln!(output, "Eligible campaigns: {eligible_count}");
+    let _ = writeln!(output, "No-claim campaigns: {missing_count}");
+    let _ = writeln!(output, "Errored lookups: {error_count}");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Wallet-side Noir fields still come from your ratatui wallet flow: pub_key_x, pub_key_y, c, s, nullifier_x, nullifier_y, stealth_tweak, message."
+    );
+
+    for (index, lookup) in lookups.iter().enumerate() {
+        write_campaign_header(&mut output, index, &lookup.campaign);
+        match &lookup.claim_status {
+            ClaimStatus::Eligible(claim) => {
+                let _ = writeln!(output, "status: eligible");
+                let _ = writeln!(output, "claim_campaign_id: {}", claim.campaign_id);
+                let _ = writeln!(output, "claim_name: {}", claim.name);
+                let _ = writeln!(
+                    output,
+                    "claim_campaign_creator_address: {}",
+                    claim.campaign_creator_address
+                );
+                let _ = writeln!(output, "amount: {}", claim.amount);
+                let _ = writeln!(output, "leaf_address: {}", claim.leaf_address);
+                let _ = writeln!(output, "leaf_index: {}", claim.index);
+                let _ = writeln!(output, "leaf_value: {}", claim.leaf_value);
+                let _ = writeln!(output, "proof_path_len: {}", claim.proof.len());
+                let _ = writeln!(output, "claim_merkle_root: {}", claim.merkle_root);
+                let _ = writeln!(output, "claim_hash_algorithm: {}", claim.hash_algorithm);
+                let _ = writeln!(output, "claim_leaf_encoding: {}", claim.leaf_encoding);
+                let _ = writeln!(output, "eligible_root: {}", claim.noir_inputs.eligible_root);
+                let _ = writeln!(
+                    output,
+                    "eligible_index: {}",
+                    claim.noir_inputs.eligible_index
+                );
+                let _ = writeln!(output, "noir_leaf_value: {}", claim.noir_inputs.leaf_value);
+                let _ = writeln!(output, "tree_depth: {}", claim.noir_inputs.tree_depth);
+                let _ = writeln!(output, "eligible_path:");
+                for (path_index, item) in claim.noir_inputs.eligible_path.iter().enumerate() {
+                    let _ = writeln!(output, "  [{path_index}] {item}");
+                }
+            }
+            ClaimStatus::Missing => {
+                let _ = writeln!(output, "status: no claim for this wallet address");
+            }
+            ClaimStatus::Error(message) => {
+                let _ = writeln!(output, "status: lookup error");
+                let _ = writeln!(output, "error: {message}");
+            }
+        }
+        let _ = writeln!(output);
+    }
+
+    output
+}
+
+fn write_campaign_header(output: &mut String, index: usize, campaign: &ApiCampaignSummary) {
+    let _ = writeln!(output, "[{}] {}", index + 1, campaign.name);
+    let _ = writeln!(output, "campaign_id: {}", campaign.campaign_id);
+    let _ = writeln!(
+        output,
+        "campaign_creator_address: {}",
+        campaign.campaign_creator_address
+    );
+    let _ = writeln!(output, "merkle_root: {}", campaign.merkle_root);
+    let _ = writeln!(output, "leaf_count: {}", campaign.leaf_count);
+    let _ = writeln!(output, "depth: {}", campaign.depth);
+    let _ = writeln!(output, "hash_algorithm: {}", campaign.hash_algorithm);
+    let _ = writeln!(output, "leaf_encoding: {}", campaign.leaf_encoding);
+}
+
 fn run_cast_command(args: &[String]) -> AppResult<CommandResult> {
     let output = Command::new("cast")
         .args(args)
+        .stdin(Stdio::null())
         .output()
-        .map_err(|source| AppError::command_launch(format!("cast {}", args.join(" ")), source))?;
+        .map_err(|source| {
+            AppError::command_launch(format!("cast {}", format_command_preview(args)), source)
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -519,8 +1037,21 @@ fn run_cast_command(args: &[String]) -> AppResult<CommandResult> {
 }
 
 fn format_command_preview(args: &[String]) -> String {
+    let mut mask_next = false;
     args.iter()
         .map(|arg| {
+            if mask_next {
+                mask_next = false;
+                return "<hidden>".to_string();
+            }
+
+            if matches!(
+                arg.as_str(),
+                "--private-key" | "--unsafe-password" | "--password"
+            ) {
+                mask_next = true;
+            }
+
             if arg.contains(' ') {
                 format!("\"{arg}\"")
             } else {
