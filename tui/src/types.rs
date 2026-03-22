@@ -57,6 +57,8 @@ pub struct CommandResult {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ApiCampaignSummary {
     pub campaign_id: String,
+    #[serde(default)]
+    pub onchain_campaign_id: Option<String>,
     pub name: String,
     pub campaign_creator_address: String,
     pub merkle_root: String,
@@ -78,6 +80,8 @@ pub struct ApiNoirClaimInputs {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ApiClaimPayload {
     pub campaign_id: String,
+    #[serde(default)]
+    pub onchain_campaign_id: Option<String>,
     pub name: String,
     pub campaign_creator_address: String,
     pub leaf_address: String,
@@ -139,9 +143,9 @@ impl App {
                 },
                 ActionForm {
                     kind: ActionKind::GenerateZkWitness,
-                    label: "Generate ZK Witness",
-                    command_label: "write Prover.toml + nargo execute",
-                    description: "Use a saved Foundry wallet to decrypt the real wallet secret locally, fetch campaign claim inputs, apply the TUI's fixed MVP Noir inputs, write the Noir prover file, and solve the witness for the stealthdrop circuit.",
+                    label: "Prove + Claim",
+                    command_label: "API claim + nargo + bb + cast send",
+                    description: "Resolve a saved Foundry wallet, fetch the Rust API claim payload, write Prover.toml, generate the witness plus zk proof, preview the decoded stealth recipient, and submit the claim transaction to ZusProtocol.",
                     fields: vec![
                         FormField {
                             key: "api_base_url",
@@ -152,10 +156,26 @@ impl App {
                             required: true,
                         },
                         FormField {
-                            key: "campaign_id",
-                            label: "Campaign ID",
-                            hint: "required: campaign UUID",
+                            key: "campaign_selector",
+                            label: "Campaign",
+                            hint: "required: campaign name for this wallet",
                             value: String::new(),
+                            sensitive: false,
+                            required: true,
+                        },
+                        FormField {
+                            key: "protocol_address",
+                            label: "Protocol",
+                            hint: "required: deployed ZusProtocol address",
+                            value: String::new(),
+                            sensitive: false,
+                            required: true,
+                        },
+                        FormField {
+                            key: "rpc_url",
+                            label: "RPC URL",
+                            hint: "https://avalanche-fuji.drpc.org",
+                            value: default_rpc_url(),
                             sensitive: false,
                             required: true,
                         },
@@ -198,6 +218,30 @@ impl App {
                             value: "claim_witness".to_string(),
                             sensitive: false,
                             required: false,
+                        },
+                        FormField {
+                            key: "bb_crs_path",
+                            label: "BB CRS Path",
+                            hint: "~/.bb-crs",
+                            value: default_bb_crs_path(),
+                            sensitive: false,
+                            required: true,
+                        },
+                        FormField {
+                            key: "verifier_vk_path",
+                            label: "Verifier VK",
+                            hint: "../verifier/generated/stealthdrop/vk/vk",
+                            value: default_verifier_vk_path(),
+                            sensitive: false,
+                            required: true,
+                        },
+                        FormField {
+                            key: "proof_output_dir",
+                            label: "Proof Output Dir",
+                            hint: "../verifier/generated/stealthdrop/proof_tui",
+                            value: default_proof_output_dir(),
+                            sensitive: false,
+                            required: true,
                         },
                     ],
                 },
@@ -340,7 +384,7 @@ impl App {
             selected_field: 0,
             focus: Focus::Actions,
             output:
-                "Campaign Explorer checks claimability. Generate ZK Witness resolves a saved wallet, fetches campaign claim inputs, writes Prover.toml, and runs the Noir witness solver."
+                "Campaign Explorer checks claimability. Prove + Claim resolves a saved wallet, fetches the Rust API claim payload, writes Prover.toml, generates the proof, and submits the claim transaction."
                     .to_string(),
             last_command: "GET http://127.0.0.1:3000/campaigns".to_string(),
             status: "Ready".to_string(),
@@ -454,6 +498,60 @@ fn default_circuit_dir() -> String {
         current_dir.parent().map(|parent| parent.join("zus_addy"))
     } else {
         Some(current_dir.join("zus_addy"))
+    };
+
+    candidate
+        .unwrap_or_else(|| PathBuf::from(fallback.clone()))
+        .display()
+        .to_string()
+}
+
+fn default_rpc_url() -> String {
+    "https://avalanche-fuji.drpc.org".to_string()
+}
+
+fn default_bb_crs_path() -> String {
+    env::var("BB_CRS_PATH")
+        .or_else(|_| env::var("HOME").map(|home| format!("{home}/.bb-crs")))
+        .unwrap_or_else(|_| "~/.bb-crs".to_string())
+}
+
+fn default_verifier_vk_path() -> String {
+    let current_dir = env::current_dir().ok();
+    let fallback = "../verifier/generated/stealthdrop/vk/vk".to_string();
+
+    let Some(current_dir) = current_dir else {
+        return fallback;
+    };
+
+    let candidate = if current_dir.file_name().and_then(|name| name.to_str()) == Some("tui") {
+        current_dir
+            .parent()
+            .map(|parent| parent.join("verifier/generated/stealthdrop/vk/vk"))
+    } else {
+        Some(current_dir.join("verifier/generated/stealthdrop/vk/vk"))
+    };
+
+    candidate
+        .unwrap_or_else(|| PathBuf::from(fallback.clone()))
+        .display()
+        .to_string()
+}
+
+fn default_proof_output_dir() -> String {
+    let current_dir = env::current_dir().ok();
+    let fallback = "../verifier/generated/stealthdrop/proof_tui".to_string();
+
+    let Some(current_dir) = current_dir else {
+        return fallback;
+    };
+
+    let candidate = if current_dir.file_name().and_then(|name| name.to_str()) == Some("tui") {
+        current_dir
+            .parent()
+            .map(|parent| parent.join("verifier/generated/stealthdrop/proof_tui"))
+    } else {
+        Some(current_dir.join("verifier/generated/stealthdrop/proof_tui"))
     };
 
     candidate

@@ -81,6 +81,11 @@ struct AutoWitnessSecrets {
     stealth_tweak: [u8; 32],
 }
 
+struct ResolvedCampaignClaim {
+    campaign: ApiCampaignSummary,
+    claim: ApiClaimPayload,
+}
+
 impl App {
     fn run(&mut self) {
         let action_kind = self.current_form().kind;
@@ -515,7 +520,7 @@ fn build_command(form: &ActionForm) -> AppResult<Vec<String>> {
             "Campaign Explorer is handled through the proof API, not cast.",
         )),
         ActionKind::GenerateZkWitness => Err(AppError::message(
-            "Generate ZK Witness is handled through the Noir circuit flow, not cast.",
+            "Prove + Claim is handled through the Noir plus protocol flow, not plain cast.",
         )),
         ActionKind::ListAccounts => {
             let keystore_dir = normalize_path(form.value("keystore_dir"));
@@ -614,8 +619,16 @@ fn focus_fields_for_error(app: &mut App, message: &str) {
     let lowered = message.to_ascii_lowercase();
     let key = if lowered.contains("api base url") {
         Some("api_base_url")
-    } else if lowered.contains("campaign id") {
-        Some("campaign_id")
+    } else if lowered.contains("campaign id")
+        || lowered.contains("campaign uuid")
+        || lowered.contains("campaign name")
+        || lowered.contains("campaign ")
+    {
+        Some("campaign_selector")
+    } else if lowered.contains("protocol") {
+        Some("protocol_address")
+    } else if lowered.contains("rpc url") {
+        Some("rpc_url")
     } else if lowered.contains("wallet address") {
         Some("wallet_address")
     } else if lowered.contains("wallet account") {
@@ -626,6 +639,12 @@ fn focus_fields_for_error(app: &mut App, message: &str) {
         Some("keystore_path")
     } else if lowered.contains("circuit dir") {
         Some("circuit_dir")
+    } else if lowered.contains("verifier vk") {
+        Some("verifier_vk_path")
+    } else if lowered.contains("proof output dir") {
+        Some("proof_output_dir")
+    } else if lowered.contains("bb crs") {
+        Some("bb_crs_path")
     } else if lowered.contains("witness name") {
         Some("witness_name")
     } else if lowered.contains("keystore dir") {
@@ -721,12 +740,38 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
         "api_base_url",
         "API base URL is required.",
     )?)?;
-    let campaign_id = required_value(form, "campaign_id", "Campaign ID is required.")?;
+    let protocol_address = normalize_protocol_address(&required_value(
+        form,
+        "protocol_address",
+        "Protocol address is required.",
+    )?)?;
+    let rpc_url = normalize_rpc_url(&required_value(
+        form,
+        "rpc_url",
+        "RPC URL is required.",
+    )?)?;
+    let campaign_selector = required_value(
+        form,
+        "campaign_selector",
+        "Campaign name or UUID is required.",
+    )?;
     let circuit_dir = normalize_circuit_dir(&required_value(
         form,
         "circuit_dir",
         "Circuit dir is required.",
     )?)?;
+    let bb_crs_path = normalize_existing_dir(
+        &required_value(form, "bb_crs_path", "BB CRS path is required.")?,
+        "BB CRS path",
+    )?;
+    let verifier_vk_path = normalize_existing_file(
+        &required_value(form, "verifier_vk_path", "Verifier VK path is required.")?,
+        "Verifier VK path",
+    )?;
+    let proof_output_dir = normalize_output_dir(
+        &required_value(form, "proof_output_dir", "Proof output dir is required.")?,
+        "Proof output dir",
+    )?;
     let witness_name = if form.value("witness_name").is_empty() {
         "claim_witness".to_string()
     } else {
@@ -734,7 +779,14 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
     };
 
     let wallet = resolve_wallet_for_zk(form)?;
-    let claim = fetch_claim_payload_for_campaign(&api_base, &campaign_id, &wallet.address)?;
+    let resolved_campaign = resolve_campaign_claim_for_wallet(
+        &api_base,
+        &campaign_selector,
+        &wallet.address,
+    )?;
+    let claim = resolved_campaign.claim;
+    let campaign = resolved_campaign.campaign;
+    let onchain_campaign_id = resolve_onchain_campaign_id(&claim)?;
     let prover_path = circuit_dir.join("Prover.toml");
     let secrets = generate_auto_witness_secrets()?;
     let prover_contents = build_prover_toml_contents(&wallet, &claim, &secrets)?;
@@ -744,18 +796,91 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
     })?;
 
     let execute_result = run_nargo_execute(&circuit_dir, &witness_name)?;
+    if !execute_result.success {
+        return Ok(CommandResult {
+            command_preview: format!(
+                "write {} + nargo execute {}",
+                prover_path.display(),
+                witness_name
+            ),
+            output: execute_result.output,
+            success: false,
+        });
+    }
+
     let witness_path = circuit_dir
         .join("target")
         .join(format!("{witness_name}.gz"));
     let bytecode_path = circuit_dir.join("target").join("stealthdrop.json");
+    let prove_result = run_bb_prove(
+        &bytecode_path,
+        &witness_path,
+        &verifier_vk_path,
+        &proof_output_dir,
+        &bb_crs_path,
+    )?;
+    if !prove_result.success {
+        return Ok(CommandResult {
+            command_preview: format!(
+                "write {} + nargo execute {} + bb prove",
+                prover_path.display(),
+                witness_name
+            ),
+            output: prove_result.output,
+            success: false,
+        });
+    }
+
+    let proof_path = proof_output_dir.join("proof");
+    let public_inputs_path = proof_output_dir.join("public_inputs");
+    let proof_hex = encode_file_as_hex(&proof_path)?;
+    let public_inputs = encode_public_inputs_array(&public_inputs_path)?;
+    let preview_result = run_cast_command_with_preview(
+        &build_protocol_preview_args(
+            &protocol_address,
+            &onchain_campaign_id,
+            &public_inputs,
+            &rpc_url,
+        ),
+        format!("cast call {protocol_address} previewClaim(..)"),
+    )?;
+    if !preview_result.success {
+        return Ok(CommandResult {
+            command_preview: "cast call previewClaim(..)".to_string(),
+            output: preview_result.output,
+            success: false,
+        });
+    }
+
+    let private_key_hex = format!("0x{}", bytes_to_hex(&wallet.wallet_secret));
+    let claim_result = run_cast_command_with_preview(
+        &build_protocol_claim_args(
+            &protocol_address,
+            &onchain_campaign_id,
+            &proof_hex,
+            &public_inputs,
+            &rpc_url,
+            &private_key_hex,
+        ),
+        format!("cast send {protocol_address} claim(..)"),
+    )?;
+
     let mut output = String::new();
     let _ = writeln!(output, "Resolved wallet: {}", wallet.account_label);
     let _ = writeln!(output, "Resolved address: {}", wallet.address);
-    let _ = writeln!(output, "Campaign ID: {campaign_id}");
+    let _ = writeln!(output, "Campaign selector: {campaign_selector}");
+    let _ = writeln!(output, "Resolved campaign name: {}", campaign.name);
+    let _ = writeln!(output, "Resolved campaign ID: {}", claim.campaign_id);
+    let _ = writeln!(output, "Onchain Campaign ID: {}", onchain_campaign_id);
+    let _ = writeln!(output, "Protocol address: {}", protocol_address);
+    let _ = writeln!(output, "RPC URL: {}", rpc_url);
     let _ = writeln!(output, "Claim leaf address: {}", claim.leaf_address);
     let _ = writeln!(output, "Prover file: {}", prover_path.display());
     let _ = writeln!(output, "Witness path: {}", witness_path.display());
     let _ = writeln!(output, "Bytecode path: {}", bytecode_path.display());
+    let _ = writeln!(output, "Verifier VK: {}", verifier_vk_path.display());
+    let _ = writeln!(output, "BB CRS path: {}", bb_crs_path.display());
+    let _ = writeln!(output, "Proof output dir: {}", proof_output_dir.display());
     let _ = writeln!(output, "Message hex: {}", bytes_to_hex(&secrets.message));
     let _ = writeln!(
         output,
@@ -775,28 +900,25 @@ fn run_generate_zk_witness(form: &ActionForm) -> AppResult<CommandResult> {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Next proof step: bb prove -s ultra_honk -b {} -w {} -o {}/proof",
-        bytecode_path.display(),
-        witness_path.display(),
-        circuit_dir.join("target").display()
+        "bb prove output:\n{}",
+        prove_result.output.trim()
     );
+    let _ = writeln!(output);
+    let _ = writeln!(output, "previewClaim output:\n{}", preview_result.output.trim());
+    let _ = writeln!(output);
+    let _ = writeln!(output, "claim tx output:\n{}", claim_result.output.trim());
     let _ = writeln!(
         output,
-        "Note: the installed bb CLI still needs extra VK setup on this machine, so this action currently wires the proven path through Noir witness generation."
-    );
-    let _ = writeln!(
-        output,
-        "Circuit public outputs now include nullifier_x, nullifier_y, and stealth_address."
+        "Circuit public outputs now include nullifier_x, nullifier_y, and stealth_address, and this action used them to send the onchain claim transaction."
     );
 
     Ok(CommandResult {
         command_preview: format!(
-            "write {} + nargo execute {}",
-            prover_path.display(),
+            "GET claim payload + nargo execute {} + bb prove + cast send claim(..)",
             witness_name
         ),
         output,
-        success: execute_result.success,
+        success: claim_result.success,
     })
 }
 
@@ -850,21 +972,95 @@ fn resolve_wallet_for_zk(form: &ActionForm) -> AppResult<ResolvedWallet> {
     })
 }
 
-fn fetch_claim_payload_for_campaign(
+fn resolve_campaign_claim_for_wallet(
     api_base: &str,
-    campaign_id: &str,
+    campaign_selector: &str,
     wallet_address: &str,
-) -> AppResult<ApiClaimPayload> {
-    let claim_url = format!("{api_base}/campaigns/{campaign_id}/claim/{wallet_address}");
+) -> AppResult<ResolvedCampaignClaim> {
+    let trimmed_selector = campaign_selector.trim();
+    if trimmed_selector.is_empty() {
+        return Err(AppError::message(
+            "Campaign name or UUID is required.".to_string(),
+        ));
+    }
+
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|source| AppError::http("failed to build the proof API client", source))?;
-    let response = client
-        .get(&claim_url)
+    let campaigns_url = format!("{api_base}/campaigns");
+    let campaigns_response = client
+        .get(&campaigns_url)
         .send()
-        .map_err(|source| AppError::http(format!("failed to fetch {claim_url}"), source))?;
-    parse_json_response::<ApiClaimPayload>(response, &claim_url)
+        .map_err(|source| AppError::http(format!("failed to fetch {campaigns_url}"), source))?;
+    let campaigns =
+        parse_json_response::<Vec<ApiCampaignSummary>>(campaigns_response, &campaigns_url)?;
+
+    let matching_campaigns = campaigns
+        .into_iter()
+        .filter(|campaign| campaign_matches_selector(campaign, trimmed_selector))
+        .collect::<Vec<_>>();
+
+    if matching_campaigns.is_empty() {
+        return Err(AppError::message(format!(
+            "No campaign matched '{trimmed_selector}'. Try the exact campaign name shown in Campaign Explorer."
+        )));
+    }
+
+    let mut eligible_matches = Vec::new();
+    let mut last_missing_match = None;
+
+    for campaign in matching_campaigns {
+        match lookup_claim_for_campaign(&client, api_base, wallet_address, campaign.clone()).claim_status {
+            ClaimStatus::Eligible(claim) => {
+                eligible_matches.push(ResolvedCampaignClaim { campaign, claim });
+            }
+            ClaimStatus::Missing => {
+                last_missing_match = Some(campaign);
+            }
+            ClaimStatus::Error(message) => {
+                return Err(AppError::message(format!(
+                    "Failed to resolve campaign '{trimmed_selector}' for wallet {wallet_address}: {message}"
+                )));
+            }
+        }
+    }
+
+    match eligible_matches.len() {
+        1 => Ok(eligible_matches.remove(0)),
+        0 => {
+            if let Some(campaign) = last_missing_match {
+                Err(AppError::message(format!(
+                    "Campaign '{}' matched, but wallet {} is not eligible for it.",
+                    campaign.name, wallet_address
+                )))
+            } else {
+                Err(AppError::message(format!(
+                    "No eligible campaign matched '{trimmed_selector}' for wallet {wallet_address}."
+                )))
+            }
+        }
+        _ => {
+            let names = eligible_matches
+                .iter()
+                .map(|resolved| format!("{} ({})", resolved.campaign.name, resolved.campaign.campaign_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AppError::message(format!(
+                "Multiple eligible campaigns matched '{trimmed_selector}'. Use a UUID instead. Matches: {names}"
+            )))
+        }
+    }
+}
+
+fn campaign_matches_selector(campaign: &ApiCampaignSummary, selector: &str) -> bool {
+    campaign.campaign_id.eq_ignore_ascii_case(selector)
+        || campaign
+            .onchain_campaign_id
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(selector))
+            .unwrap_or(false)
+        || campaign.name.eq_ignore_ascii_case(selector)
 }
 
 fn build_prover_toml_contents(
@@ -892,6 +1088,219 @@ fn build_prover_toml_contents(
     ));
     prover.push_str(&format_u8_array_toml("wallet_secret", &wallet.wallet_secret));
     Ok(prover)
+}
+
+fn resolve_onchain_campaign_id(claim: &ApiClaimPayload) -> AppResult<String> {
+    if let Some(onchain_campaign_id) = claim.onchain_campaign_id.as_deref() {
+        if is_bytes32_hex(onchain_campaign_id) {
+            return Ok(onchain_campaign_id.to_string());
+        }
+    }
+
+    derive_onchain_campaign_id_from_uuid(&claim.campaign_id)
+}
+
+fn derive_onchain_campaign_id_from_uuid(raw: &str) -> AppResult<String> {
+    let compact = raw.trim().replace('-', "");
+    if compact.len() != 32 || !compact.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(AppError::message(format!(
+            "Campaign ID must be a canonical UUID so the TUI can derive the onchain campaign id: {}",
+            raw.trim()
+        )));
+    }
+
+    Ok(format!("0x{:0>64}", compact.to_ascii_lowercase()))
+}
+
+fn is_bytes32_hex(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() == 66
+        && trimmed.starts_with("0x")
+        && trimmed[2..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+}
+
+fn normalize_protocol_address(raw: &str) -> AppResult<String> {
+    normalize_wallet_address(raw)
+}
+
+fn normalize_rpc_url(raw: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::message("RPC URL is required."));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_existing_file(raw: &str, label: &str) -> AppResult<PathBuf> {
+    let path = PathBuf::from(normalize_path(raw));
+    if !path.exists() {
+        return Err(AppError::message(format!(
+            "{label} does not exist: {}",
+            path.display()
+        )));
+    }
+    if !path.is_file() {
+        return Err(AppError::message(format!(
+            "{label} must point to a file: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn normalize_existing_dir(raw: &str, label: &str) -> AppResult<PathBuf> {
+    let path = PathBuf::from(normalize_path(raw));
+    if !path.exists() {
+        return Err(AppError::message(format!(
+            "{label} does not exist: {}",
+            path.display()
+        )));
+    }
+    if !path.is_dir() {
+        return Err(AppError::message(format!(
+            "{label} must point to a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn normalize_output_dir(raw: &str, label: &str) -> AppResult<PathBuf> {
+    let path = PathBuf::from(normalize_path(raw));
+    if path.as_os_str().is_empty() {
+        return Err(AppError::message(format!("{label} is required.")));
+    }
+
+    fs::create_dir_all(&path)
+        .map_err(|source| AppError::io(format!("failed to create {}", path.display()), source))?;
+    Ok(path)
+}
+
+fn run_bb_prove(
+    bytecode_path: &Path,
+    witness_path: &Path,
+    verifier_vk_path: &Path,
+    proof_output_dir: &Path,
+    bb_crs_path: &Path,
+) -> AppResult<CommandResult> {
+    let args = vec![
+        "prove".to_string(),
+        "-t".to_string(),
+        "evm".to_string(),
+        "-b".to_string(),
+        bytecode_path.display().to_string(),
+        "-w".to_string(),
+        witness_path.display().to_string(),
+        "-k".to_string(),
+        verifier_vk_path.display().to_string(),
+        "-o".to_string(),
+        proof_output_dir.display().to_string(),
+        "--verify".to_string(),
+    ];
+    let output = Command::new("bb")
+        .args(&args)
+        .env("BB_CRS_PATH", bb_crs_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            AppError::command_launch(
+                format!(
+                    "bb prove -t evm -b {} -w {} -k {} -o {} --verify",
+                    bytecode_path.display(),
+                    witness_path.display(),
+                    verifier_vk_path.display(),
+                    proof_output_dir.display()
+                ),
+                source,
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = match (stdout.trim(), stderr.trim()) {
+        ("", "") => "(no output)".to_string(),
+        ("", stderr) => stderr.to_string(),
+        (stdout, "") => stdout.to_string(),
+        (stdout, stderr) => format!("{stdout}\n\n{stderr}"),
+    };
+
+    Ok(CommandResult {
+        command_preview: format!(
+            "bb prove -t evm -b {} -w {} -k {} -o {} --verify",
+            bytecode_path.display(),
+            witness_path.display(),
+            verifier_vk_path.display(),
+            proof_output_dir.display()
+        ),
+        output: combined,
+        success: output.status.success(),
+    })
+}
+
+fn encode_file_as_hex(path: &Path) -> AppResult<String> {
+    let bytes = fs::read(path)
+        .map_err(|source| AppError::io(format!("failed to read {}", path.display()), source))?;
+    Ok(format!("0x{}", bytes_to_hex(&bytes)))
+}
+
+fn encode_public_inputs_array(path: &Path) -> AppResult<String> {
+    let bytes = fs::read(path)
+        .map_err(|source| AppError::io(format!("failed to read {}", path.display()), source))?;
+    if bytes.len() % 32 != 0 {
+        return Err(AppError::message(format!(
+            "Public inputs file must be a multiple of 32 bytes: {}",
+            path.display()
+        )));
+    }
+
+    let mut items = Vec::with_capacity(bytes.len() / 32);
+    for chunk in bytes.chunks_exact(32) {
+        items.push(format!("0x{}", bytes_to_hex(chunk)));
+    }
+
+    Ok(format!("[{}]", items.join(",")))
+}
+
+fn build_protocol_preview_args(
+    protocol_address: &str,
+    onchain_campaign_id: &str,
+    public_inputs: &str,
+    rpc_url: &str,
+) -> Vec<String> {
+    vec![
+        "call".to_string(),
+        protocol_address.to_string(),
+        "previewClaim(bytes32,bytes32[])((bytes32,bytes32,address,uint256,uint256,bool))"
+            .to_string(),
+        onchain_campaign_id.to_string(),
+        public_inputs.to_string(),
+        "--rpc-url".to_string(),
+        rpc_url.to_string(),
+    ]
+}
+
+fn build_protocol_claim_args(
+    protocol_address: &str,
+    onchain_campaign_id: &str,
+    proof_hex: &str,
+    public_inputs: &str,
+    rpc_url: &str,
+    private_key_hex: &str,
+) -> Vec<String> {
+    vec![
+        "send".to_string(),
+        protocol_address.to_string(),
+        "claim(bytes32,bytes,bytes32[])(address)".to_string(),
+        onchain_campaign_id.to_string(),
+        proof_hex.to_string(),
+        public_inputs.to_string(),
+        "--rpc-url".to_string(),
+        rpc_url.to_string(),
+        "--private-key".to_string(),
+        private_key_hex.to_string(),
+    ]
 }
 
 fn resolve_campaign_wallet_address(form: &ActionForm) -> AppResult<Option<String>> {
@@ -1340,6 +1749,9 @@ fn format_campaign_lookup_output(
             ClaimStatus::Eligible(claim) => {
                 let _ = writeln!(output, "status: eligible");
                 let _ = writeln!(output, "claim_campaign_id: {}", claim.campaign_id);
+                if let Some(onchain_campaign_id) = claim.onchain_campaign_id.as_deref() {
+                    let _ = writeln!(output, "claim_onchain_campaign_id: {}", onchain_campaign_id);
+                }
                 let _ = writeln!(output, "claim_name: {}", claim.name);
                 let _ = writeln!(
                     output,
@@ -1384,6 +1796,9 @@ fn format_campaign_lookup_output(
 fn write_campaign_header(output: &mut String, index: usize, campaign: &ApiCampaignSummary) {
     let _ = writeln!(output, "[{}] {}", index + 1, campaign.name);
     let _ = writeln!(output, "campaign_id: {}", campaign.campaign_id);
+    if let Some(onchain_campaign_id) = campaign.onchain_campaign_id.as_deref() {
+        let _ = writeln!(output, "onchain_campaign_id: {}", onchain_campaign_id);
+    }
     let _ = writeln!(
         output,
         "campaign_creator_address: {}",
@@ -1397,6 +1812,13 @@ fn write_campaign_header(output: &mut String, index: usize, campaign: &ApiCampai
 }
 
 fn run_cast_command(args: &[String]) -> AppResult<CommandResult> {
+    run_cast_command_with_preview(args, format!("cast {}", format_command_preview(args)))
+}
+
+fn run_cast_command_with_preview(
+    args: &[String],
+    command_preview: impl Into<String>,
+) -> AppResult<CommandResult> {
     let output = Command::new("cast")
         .args(args)
         .stdin(Stdio::null())
@@ -1415,7 +1837,7 @@ fn run_cast_command(args: &[String]) -> AppResult<CommandResult> {
     };
 
     Ok(CommandResult {
-        command_preview: format!("cast {}", format_command_preview(args)),
+        command_preview: command_preview.into(),
         output: combined,
         success: output.status.success(),
     })
