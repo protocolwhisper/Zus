@@ -69,6 +69,31 @@ function parseErrorMessage(error) {
   );
 }
 
+function parseNativeAmount(label, rawValue, { allowZero = false } = {}) {
+  const value = rawValue.trim();
+  if (!value) {
+    throw new Error(`${label} is required.`);
+  }
+
+  try {
+    const parsed = parseEther(value);
+    if (!allowZero && parsed <= 0n) {
+      throw new Error(`${label} must be greater than 0.`);
+    }
+
+    return {
+      displayValue: value,
+      wei: parsed.toString(),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message === `${label} must be greater than 0.`) {
+      throw error;
+    }
+
+    throw new Error(`${label} must be a valid AVAX amount.`);
+  }
+}
+
 async function readJson(response) {
   const text = await response.text();
   let payload = null;
