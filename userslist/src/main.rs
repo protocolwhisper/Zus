@@ -9,12 +9,14 @@ use crate::merkle::{
 };
 use crate::postgres::init_db;
 use axum::{
+    http::{Method, header},
     Router,
     routing::{get, post},
 };
 use dotenvy::dotenv;
 use sqlx::postgres::PgPoolOptions;
 use std::{env, net::SocketAddr, sync::Arc};
+use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_db(&pool).await?;
 
     let state = Arc::new(AppState { pool });
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE]);
     let app = Router::new()
         .route("/health", get(health))
         .route("/campaigns", get(list_campaigns).post(create_campaign))
@@ -46,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/campaign-creators/:campaign_creator_address/campaigns",
             get(list_creator_campaigns),
         )
+        .layer(cors)
         .with_state(state);
 
     let port = env::var("PORT")
