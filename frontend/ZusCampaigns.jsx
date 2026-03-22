@@ -10,6 +10,7 @@ import {
   stringToHex,
   toHex,
 } from "viem";
+import { avalancheFuji } from "viem/chains";
 import { appConfig, getCreateCampaignConfigErrors, resolveApiUrl } from "./config.js";
 import { zusProtocolAbi } from "./zusProtocolAbi.js";
 
@@ -925,11 +926,13 @@ export default function ZusCampaigns({ wallet, onConnect, onNavigateHome, onNavi
     await ensureAvalancheFuji();
 
     const walletClient = createWalletClient({
+      chain: avalancheFuji,
       transport: custom(window.ethereum),
     });
 
     const txHash = await walletClient.sendTransaction({
       account,
+      chain: avalancheFuji,
       to: appConfig.protocolAddress,
       value: BigInt(deployment.fundingWei),
       data: encodeFunctionData({
@@ -954,6 +957,7 @@ export default function ZusCampaigns({ wallet, onConnect, onNavigateHome, onNavi
     });
 
     const publicClient = createPublicClient({
+      chain: avalancheFuji,
       transport: http(appConfig.rpcUrl),
     });
 
